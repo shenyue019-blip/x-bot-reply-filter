@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         垃圾推号大扫除 - 自用版
 // @namespace    http://tampermonkey.net/
-// @version      6.17.2
+// @version      6.17.3
 // @description  扫描推文回复中的垃圾用户批量拉黑
 // @author       summeriscoming
 // @license MIT
@@ -557,6 +557,7 @@
   const GLOBAL_BLOCK_QUEUE_LONG_COOLDOWN = 5 * 60 * 1000;
   const GLOBAL_BLOCK_QUEUE_LONG_COOLDOWN_JITTER = 60 * 1000;
   const GLOBAL_BLOCK_QUEUE_PANEL_W = 136;
+  const GLOBAL_BLOCK_QUEUE_SIZE_KEY = 'global_block_queue_size_v1';
   const RESULT_PANEL_POS_KEY = 'xfs_result_panel_position_v1';
   const RESULT_PANEL_SIZE_KEY = 'xfs_result_panel_size_v1';
   const RESULT_PANEL_DOCK_POS_KEY = 'xfs_result_panel_dock_position_v1';
@@ -5137,25 +5138,51 @@
     let p = document.getElementById('xfs-global-block-queue');
     if (p) return p;
     const pos = readGlobalBlockQueuePosition();
+    const size = readFloatingPanelSize(GLOBAL_BLOCK_QUEUE_SIZE_KEY, { width: GLOBAL_BLOCK_QUEUE_PANEL_W, height: 168 });
     p = document.createElement('div');
     p.id = 'xfs-global-block-queue';
     p.style.cssText = [
       'position:fixed', `top:${pos.top}px`, `left:${pos.left}px`,
-      `width:${GLOBAL_BLOCK_QUEUE_PANEL_W}px`, 'box-sizing:border-box', 'padding:7px 8px',
+      `width:${size.width}px`, `height:${size.height}px`, 'box-sizing:border-box', 'padding:7px 8px',
       'background:rgba(247,249,249,0.78)', `color:${C.text}`,
       'backdrop-filter:blur(10px) saturate(135%)', '-webkit-backdrop-filter:blur(10px) saturate(135%)',
       'border:1px solid rgba(207,217,222,0.82)', 'border-radius:8px',
       'box-shadow:0 6px 22px rgba(15,20,25,0.10)',
       'font-size:11px', 'line-height:1.35',
+      'resize:both', 'overflow:auto',
+      'min-width:136px', 'min-height:118px',
+      'max-width:calc(100vw - 16px)', 'max-height:calc(100vh - 16px)',
       `font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif`,
       'z-index:2147483646',
     ].join(';');
     document.body.appendChild(p);
+    if (typeof ResizeObserver !== 'undefined') {
+      let saveTimer = null;
+      const resizeObserver = new ResizeObserver(() => {
+        if (!document.body.contains(p)) {
+          resizeObserver.disconnect();
+          clearTimeout(saveTimer);
+          return;
+        }
+        clearTimeout(saveTimer);
+        saveTimer = setTimeout(() => {
+          writeFloatingPanelSize(GLOBAL_BLOCK_QUEUE_SIZE_KEY, {
+            width: p.offsetWidth,
+            height: p.offsetHeight,
+          });
+          const next = clampGlobalBlockQueuePosition({ left: p.offsetLeft, top: p.offsetTop }, p);
+          p.style.left = `${next.left}px`;
+          p.style.top = `${next.top}px`;
+          writeGlobalBlockQueuePosition(next);
+        }, 160);
+      });
+      resizeObserver.observe(p);
+    }
     return p;
   }
 
   function clampGlobalBlockQueuePosition(pos, p = document.getElementById('xfs-global-block-queue')) {
-    const w = GLOBAL_BLOCK_QUEUE_PANEL_W;
+    const w = p?.offsetWidth || GLOBAL_BLOCK_QUEUE_PANEL_W;
     const h = p?.offsetHeight || 72;
     const maxLeft = Math.max(0, window.innerWidth - w - 8);
     const maxTop = Math.max(0, window.innerHeight - h - 8);
@@ -5247,7 +5274,6 @@
     const p = ensureGlobalBlockQueuePanel();
     if (!p) return;
     p.style.right = 'auto';
-    p.style.width = `${GLOBAL_BLOCK_QUEUE_PANEL_W}px`;
     p.style.padding = '8px';
     const pos = clampGlobalBlockQueuePosition(readGlobalBlockQueuePosition(), p);
     p.style.left = `${pos.left}px`;
