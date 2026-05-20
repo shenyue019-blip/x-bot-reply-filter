@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         垃圾推号大扫除 - 自用版
 // @namespace    http://tampermonkey.net/
-// @version      6.18.6
+// @version      6.18.7
 // @description  扫描推文回复中的垃圾用户批量拉黑
 // @author       summeriscoming
 // @license MIT
@@ -589,6 +589,8 @@
   const AI_LEARNING_EXAMPLES_KEY = 'xfs-ai-learning-examples-v1';
   const AI_LEARNING_LAST_KEY = 'xfs-ai-learning-last-v1';
   const AI_LEARNING_EXAMPLES_MAX = 300;
+  const AI_WORK_LOG_KEY = 'xfs-ai-work-log-v1';
+  const AI_WORK_LOG_MAX = 5000;
   const AI_AUTO_RULES_KEY = 'xfs-ai-auto-rules-v1';
   const AI_REVIEW_DEFAULT_MODEL = 'gpt-5.5';
   const DAY_MS = 24 * 60 * 60 * 1000;
@@ -641,6 +643,7 @@
   let globalQueuePanelSuppressed = false;
   let refreshAiReviewControlsFn = null;
   let refreshAiLearningControlsFn = null;
+  let refreshAiWorkLogControlsFn = null;
   let experimentalBrowseBlockHeartbeatTimer = null;
   const matchedHandlesInView = new Set(); // accumulates matched handles this scroll session; reset on nav
   const matchedUsersCache = new Map();   // handle → full user object; survives DOM unload by React virtual list
@@ -1252,6 +1255,31 @@
     };
   }
 
+  function loadAiWorkLog() {
+    const raw = GM_getValue(AI_WORK_LOG_KEY, []);
+    if (!Array.isArray(raw)) return [];
+    return raw
+      .map(item => ({
+        kind: String(item?.kind || 'decision'),
+        label: ['block', 'hide', 'ignore'].includes(item?.label) ? item.label : 'ignore',
+        handle: normalizeHandle(item?.handle || ''),
+        displayName: String(item?.displayName || ''),
+        source: String(item?.source || ''),
+        reason: String(item?.reason || ''),
+        action: ['block', 'hide', 'ignore'].includes(item?.action) ? item.action : 'ignore',
+        confidence: Math.max(0, Math.min(1, Number(item?.confidence) || 0)),
+        ruleSuggestion: item?.ruleSuggestion && typeof item.ruleSuggestion === 'object' ? {
+          scope: String(item.ruleSuggestion.scope || ''),
+          value: String(item.ruleSuggestion.value || ''),
+          note: String(item.ruleSuggestion.note || ''),
+          confidence: Math.max(0, Math.min(1, Number(item.ruleSuggestion.confidence) || 0)),
+        } : null,
+        fingerprint: String(item?.fingerprint || ''),
+        ts: Number(item?.ts || 0) || Date.now(),
+      }))
+      .filter(item => item.handle || item.displayName || item.reason || item.action);
+  }
+
   function saveAiLearningExamples(list = aiLearningExamples) {
     const items = (Array.isArray(list) ? list : [])
       .sort((a, b) => Number(b.ts || 0) - Number(a.ts || 0))
@@ -1271,6 +1299,37 @@
       fingerprint: String(entry.fingerprint || ''),
       ts: Number(entry.ts || Date.now()) || Date.now(),
     });
+  }
+
+  function saveAiWorkLog(list = aiWorkLog) {
+    const items = (Array.isArray(list) ? list : [])
+      .sort((a, b) => Number(b.ts || 0) - Number(a.ts || 0));
+    aiWorkLog = items;
+    GM_setValue(AI_WORK_LOG_KEY, items);
+  }
+
+  function recordAiWorkLog(entry) {
+    const item = {
+      kind: String(entry?.kind || 'decision'),
+      label: ['block', 'hide', 'ignore'].includes(entry?.label) ? entry.label : 'ignore',
+      handle: normalizeHandle(entry?.handle || ''),
+      displayName: String(entry?.displayName || ''),
+      source: String(entry?.source || ''),
+      reason: String(entry?.reason || ''),
+      action: ['block', 'hide', 'ignore'].includes(entry?.action) ? entry.action : 'ignore',
+      confidence: Math.max(0, Math.min(1, Number(entry?.confidence) || 0)),
+      ruleSuggestion: entry?.ruleSuggestion && typeof entry.ruleSuggestion === 'object' ? {
+        scope: String(entry.ruleSuggestion.scope || ''),
+        value: String(entry.ruleSuggestion.value || ''),
+        note: String(entry.ruleSuggestion.note || ''),
+        confidence: Math.max(0, Math.min(1, Number(entry.ruleSuggestion.confidence) || 0)),
+      } : null,
+      fingerprint: String(entry?.fingerprint || aiReviewFingerprint(entry || {})),
+      ts: Number(entry?.ts || Date.now()) || Date.now(),
+    };
+    aiWorkLog.unshift(item);
+    saveAiWorkLog();
+    if (typeof refreshAiWorkLogControlsFn === 'function') refreshAiWorkLogControlsFn();
   }
 
   function recordAiLearningExample(user, label, meta = {}) {
@@ -1381,6 +1440,7 @@
   const aiHiddenHandles = loadAiHiddenHandles();
   const aiExemptHandles = loadAiExemptHandles();
   let aiLearningExamples = loadAiLearningExamples();
+  let aiWorkLog = loadAiWorkLog();
   const aiReviewPending = new Map();
   const aiReviewQueue = [];
   let aiReviewQueueActive = false;
@@ -1405,14 +1465,13 @@
     return parts.join('\n');
   }
 
-  function isNameIssueMatch(user) {
+  function isStrongNameIssueMatch(user) {
     if (!user) return false;
-    const heartHits = Array.isArray(user.heartHits) ? user.heartHits.length : 0;
     const nameKwHits = Array.isArray(user.nameKwHits) ? user.nameKwHits.length : 0;
     const nameRegexHits = Array.isArray(user.reHits)
       ? user.reHits.filter(hit => String(hit?.snippet || '').startsWith('昵称:')).length
       : 0;
-    return heartHits > 0 || nameKwHits > 0 || nameRegexHits > 0;
+    return nameKwHits > 0 || nameRegexHits > 0;
   }
 
   function aiReviewActionLabel(action) {
@@ -1422,7 +1481,7 @@
   }
 
   function hasAiReviewCandidates(users) {
-    return (users || []).some(user => !isNameIssueMatch(user));
+    return (users || []).some(user => !isStrongNameIssueMatch(user));
   }
 
   function queueAiReviewUsers(users, opts = {}) {
@@ -1553,6 +1612,18 @@
         try {
           const decision = await requestAiReviewDecision(item, { queueSource: item.source });
           aiReviewCacheStore(item, decision);
+          recordAiWorkLog({
+            kind: 'decision',
+            label: decision.action,
+            action: decision.action,
+            handle,
+            displayName: item.displayName,
+            source: item.source,
+            reason: decision.reason,
+            confidence: decision.confidence,
+            ruleSuggestion: decision.ruleSuggestion || null,
+            fingerprint: aiReviewFingerprint(item),
+          });
           recordAiLearningExample(item, decision.action, {
             source: item.source,
             reason: decision.reason,
@@ -2436,22 +2507,25 @@
     const allHideOnlyReHits = getRegexHits(fullText, HIDE_ONLY_RE_KWS, 'body').map(h => ({ ...h, type: 'hide_only_regex' }));
     const hideOnlyReHits = hideOnlyRulesActive ? allHideOnlyReHits : [];
     const cats = new Set();
-    const actionableCats = new Set();
+    const directCats = new Set();
+    const reviewCats = new Set();
     if (heartHits.length  > 0) cats.add('heart');
     if (nameKwHits.length > 0) cats.add('name_kw');
     if (kwHits.length     > 0) cats.add('suspect');
     if (reHits.length     > 0) cats.add('regex_kw');
     if (hideOnlyReHits.length > 0) cats.add('hide_only_regex');
-    if (heartHits.length  > 0) actionableCats.add('heart');
-    if (nameKwHits.length > 0) actionableCats.add('name_kw');
-    if (kwHits.length     > 0) actionableCats.add('suspect');
-    if (reHits.length     > 0) actionableCats.add('regex_kw');
+    if (nameKwHits.length > 0) directCats.add('name_kw');
+    if (nameReHits.length > 0) directCats.add('regex_kw');
+    if (heartHits.length  > 0) reviewCats.add('heart');
+    if (kwHits.length     > 0) reviewCats.add('suspect');
+    if (reHits.length     > 0) reviewCats.add('regex_kw');
     return {
       matched: cats.size > 0,
-      actionableMatched: actionableCats.size > 0,
+      actionableMatched: directCats.size > 0,
       hideOnlyMatched: hideOnlyReHits.length > 0,
       cats,
-      actionableCats,
+      actionableCats: directCats,
+      reviewCats,
       heartHits,
       nameKwHits,
       kwHits,
@@ -2820,7 +2894,7 @@
       ].map(a => a.textContent).join(' ');
       const fullText = [tweetText, cardText, bodyLinkText].filter(Boolean).join(' ');
 
-      const { matched, actionableMatched, actionableCats, heartHits, nameKwHits, kwHits, reHits, hideOnlyReHits } = matchesFilters(displayName, fullText);
+      const { matched, actionableMatched, actionableCats, reviewCats, heartHits, nameKwHits, kwHits, reHits, hideOnlyReHits } = matchesFilters(displayName, fullText);
       setArticleHideRuleStats(art, { nameKwHits, kwHits, reHits, hideOnlyReHits });
       if (!matched) return;
 
@@ -2831,14 +2905,15 @@
       if (userMap.has(handle)) {
         const ex = userMap.get(handle);
         actionableCats.forEach(c => ex.cats.add(c));
+        reviewCats.forEach(c => ex.reviewCats.add(c));
         heartHits.forEach(h  => { if (!ex.heartHits.includes(h))              ex.heartHits.push(h); });
         nameKwHits.forEach(h => { if (!ex.nameKwHits.includes(h))             ex.nameKwHits.push(h); });
         kwHits.forEach(h     => { if (!ex.kwHits.find(x => x.kw  === h.kw))  ex.kwHits.push(h); });
         reHits.forEach(h     => { if (!ex.reHits.find(x => x.pat === h.pat)) ex.reHits.push(h); });
         hideOnlyReHits.forEach(h => { if (!ex.hideOnlyReHits.find(x => x.pat === h.pat)) ex.hideOnlyReHits.push(h); });
         // keep tweetSnippet from first encounter
-      } else if (actionableMatched) {
-        userMap.set(handle, { handle, displayName, cats: actionableCats, heartHits, nameKwHits, kwHits, reHits, hideOnlyReHits, tweetSnippet });
+      } else {
+        userMap.set(handle, { handle, displayName, cats: new Set([...actionableCats, ...reviewCats]), reviewCats, heartHits, nameKwHits, kwHits, reHits, hideOnlyReHits, tweetSnippet });
       }
     });
 
@@ -3523,7 +3598,7 @@
     safeUsers.forEach(user => {
       if (!user) return;
       if (isAiHiddenHandle(user?.handle || '') || isAiExemptHandle(user?.handle || '')) return;
-      if (!useAiReview || isNameIssueMatch(user)) directUsers.push(user);
+      if (isStrongNameIssueMatch(user) || !useAiReview) directUsers.push(user);
       else reviewUsers.push(user);
     });
     const result = enqueueGlobalBlockUsers(directUsers, source);
@@ -5575,10 +5650,10 @@
       ].map(a => a.textContent).join(' ');
       const fullText = [textEl ? getTextWithEmoji(textEl) : null, cardEl ? getTextWithEmoji(cardEl) : null, bodyLinkText].filter(Boolean).join(' ');
       const tweetSnippet = buildUserPreviewSnippet(textEl ? getTextWithEmoji(textEl) : '', cardEl ? getTextWithEmoji(cardEl) : '', bodyLinkText);
-      const { matched, actionableMatched, actionableCats, heartHits, nameKwHits, kwHits, reHits, hideOnlyReHits, allHideOnlyReHits } = matchesFilters(displayName, fullText);
+      const { matched, actionableMatched, actionableCats, reviewCats, heartHits, nameKwHits, kwHits, reHits, hideOnlyReHits, allHideOnlyReHits } = matchesFilters(displayName, fullText);
       setArticleHideRuleStats(art, { nameKwHits, kwHits, reHits, hideOnlyReHits });
       const alreadyBlocked = blockedHandles.has(key);
-      art.dataset.xfsHideMatched = (matched && !alreadyBlocked) ? '1' : '0';
+      art.dataset.xfsHideMatched = (actionableMatched && !alreadyBlocked) ? '1' : '0';
       const btn = art.querySelector(`button[data-xfs-handle]`);
       if (btn) {
         btn.dataset.xfsMatched = (matched && !alreadyBlocked) ? '1' : '0';
@@ -5589,9 +5664,9 @@
         else delete btn.dataset.xfsHideOnlyTooltip;
         updateInlineBlockButton(btn);
       }
-      if (actionableMatched && !alreadyBlocked) {
+      if ((actionableMatched || reviewCats.size > 0) && !alreadyBlocked) {
         matchedHandlesInView.add(key);
-        const user = { handle: key, displayName, cats: actionableCats, heartHits: [...heartHits], nameKwHits: [...nameKwHits], kwHits: [...kwHits], reHits: [...reHits], hideOnlyReHits: [...hideOnlyReHits], tweetSnippet };
+        const user = { handle: key, displayName, cats: new Set([...actionableCats, ...reviewCats]), reviewCats: new Set(reviewCats), heartHits: [...heartHits], nameKwHits: [...nameKwHits], kwHits: [...kwHits], reHits: [...reHits], hideOnlyReHits: [...hideOnlyReHits], tweetSnippet };
         matchedUsersCache.set(key, user);
         maybeAutoQueueBrowseMatchedUser(user, art);
       } else {
@@ -7048,6 +7123,95 @@
     aiLearningWrap.appendChild(aiLearningList);
     refreshAiLearningControls();
 
+    const aiWorkLogWrap = document.createElement('div');
+    aiWorkLogWrap.style.cssText = `border:1px solid ${C.mute};background:#f7fffd;border-radius:8px;padding:7px;display:flex;flex-direction:column;gap:6px;`;
+    const aiWorkLogTitle = document.createElement('div');
+    aiWorkLogTitle.textContent = 'AI 工作记录';
+    aiWorkLogTitle.style.cssText = `font-size:11px;font-weight:800;color:${C.mute};`;
+    const aiWorkLogStatus = document.createElement('div');
+    aiWorkLogStatus.style.cssText = `font-size:10px;line-height:1.35;color:${C.sub};word-break:break-word;`;
+    const aiWorkLogList = document.createElement('div');
+    aiWorkLogList.style.cssText = `display:flex;flex-direction:column;gap:4px;max-height:190px;overflow:auto;padding-right:2px;`;
+    function applyAiWorkLogCorrection(item, nextLabel) {
+      const handle = normalizeHandle(item?.handle || '');
+      if (!handle) return;
+      const base = {
+        handle,
+        displayName: String(item?.displayName || handle),
+        source: 'ai_correction',
+        reason: `ai_${String(item?.action || 'ignore')}=>${nextLabel}`,
+      };
+      recordAiWorkLog({
+        kind: 'correction',
+        label: nextLabel,
+        action: nextLabel,
+        handle,
+        displayName: base.displayName,
+        source: 'ai_correction',
+        reason: base.reason,
+        confidence: Number(item?.confidence || 0),
+        fingerprint: `${String(item?.fingerprint || '')}:correction:${nextLabel}`,
+      });
+      recordAiLearningExample(base, nextLabel, { source: 'ai_correction', reason: base.reason, fingerprint: `${String(item?.fingerprint || '')}:learning:${nextLabel}` });
+      if (nextLabel === 'block') {
+        forgetAiExemptHandle(handle);
+        enqueueGlobalBlockUsers([{ ...base, source: 'manual' }], 'manual');
+        showToast(`已将 @${handle} 纠正为拉黑候选`, false);
+      } else if (nextLabel === 'hide') {
+        rememberAiHiddenHandle(base, { source: 'ai_correction', reason: base.reason, confidence: Number(item?.confidence || 0) });
+        applyHideAll();
+        showToast(`已将 @${handle} 纠正为隐藏`, false);
+      } else {
+        purgeAiMemoryForHandle(handle);
+        rememberAiExemptHandle(base, { source: 'ai_correction', reason: base.reason });
+        removeQueuedGlobalBlockForHandle(handle);
+        showToast(`已将 @${handle} 纠正为放行`, false);
+      }
+      refreshAiWorkLogControls();
+      refreshAiLearningControls();
+      refreshAiReviewControls();
+    }
+    function refreshAiWorkLogControls() {
+      const recent = aiWorkLog.slice(0, 12);
+      aiWorkLogStatus.textContent = recent.length
+        ? `记录 ${aiWorkLog.length} 条 · 最新 ${recent[0].kind} / ${recent[0].action} @${recent[0].handle || '-'}${recent[0].reason ? ` · ${recent[0].reason}` : ''}`
+        : '暂无 AI 工作记录';
+      aiWorkLogStatus.title = aiWorkLogStatus.textContent;
+      aiWorkLogList.textContent = '';
+      if (!recent.length) {
+        const empty = document.createElement('div');
+        empty.textContent = '暂无工作记录';
+        empty.style.cssText = `font-size:10px;color:${C.sub};padding:4px 0;`;
+        aiWorkLogList.appendChild(empty);
+        return;
+      }
+      recent.forEach(item => {
+        const row = document.createElement('div');
+        row.style.cssText = `padding:4px 6px;border:1px solid ${C.border};border-radius:6px;background:#fff;font-size:10px;line-height:1.35;word-break:break-word;display:flex;flex-direction:column;gap:4px;`;
+        const text = document.createElement('div');
+        text.textContent = `${item.kind} · ${item.action} · @${item.handle || '-'}${item.displayName ? ` (${item.displayName})` : ''}${item.source ? ` · ${item.source}` : ''}${item.reason ? ` · ${item.reason}` : ''}${item.confidence ? ` · ${Math.round(item.confidence * 100)}%` : ''}`;
+        text.style.cssText = `color:${C.text};`;
+        const actions = document.createElement('div');
+        actions.style.cssText = 'display:flex;gap:4px;flex-wrap:wrap;';
+        ['block', 'hide', 'ignore'].forEach(nextLabel => {
+          const b = document.createElement('button');
+          b.type = 'button';
+          b.textContent = nextLabel === 'block' ? '纠正拉黑' : (nextLabel === 'hide' ? '纠正隐藏' : '纠正放行');
+          b.style.cssText = `border:1px solid ${C.btnBorder};background:#fff;color:${nextLabel === 'block' ? C.blockRed : (nextLabel === 'hide' ? C.mute : C.sub)};border-radius:6px;padding:2px 6px;font-size:10px;cursor:pointer;`;
+          b.onclick = () => applyAiWorkLogCorrection(item, nextLabel);
+          actions.appendChild(b);
+        });
+        row.appendChild(text);
+        row.appendChild(actions);
+        aiWorkLogList.appendChild(row);
+      });
+    }
+    refreshAiWorkLogControlsFn = refreshAiWorkLogControls;
+    aiWorkLogWrap.appendChild(aiWorkLogTitle);
+    aiWorkLogWrap.appendChild(aiWorkLogStatus);
+    aiWorkLogWrap.appendChild(aiWorkLogList);
+    refreshAiWorkLogControls();
+
     function refreshRemoteRulesControls() {
       remoteRulesBtn.textContent = `远程规则订阅：${remoteRulesActive ? '开' : '关'}`;
       remoteRulesBtn.style.borderColor = remoteRulesActive ? C.nameKw : C.btnBorder;
@@ -7254,6 +7418,7 @@
     grid.appendChild(hideOnlyRulesBtn);
     grid.appendChild(aiReviewWrap);
     grid.appendChild(aiLearningWrap);
+    grid.appendChild(aiWorkLogWrap);
     grid.appendChild(remoteWrap);
     grid.appendChild(youngWrap);
     grid.appendChild(mkToolBtn('两类账号说明', showCategoryHelp));
@@ -7368,23 +7533,24 @@
       const allowFilterHighlight = location.pathname !== '/home';
       const matchInfo = allowFilterHighlight && !isProtectedVerified
         ? matchesFilters(displayName, fullText)
-        : { matched: false, actionableMatched: false, cats: new Set(), actionableCats: new Set(), heartHits: [], nameKwHits: [], kwHits: [], reHits: [], hideOnlyReHits: [], allHideOnlyReHits: [] };
-      const { matched, actionableMatched, actionableCats, heartHits, nameKwHits, kwHits, reHits, hideOnlyReHits, allHideOnlyReHits } = matchInfo;
+        : { matched: false, actionableMatched: false, cats: new Set(), actionableCats: new Set(), reviewCats: new Set(), heartHits: [], nameKwHits: [], kwHits: [], reHits: [], hideOnlyReHits: [], allHideOnlyReHits: [] };
+      const { matched, actionableMatched, actionableCats, reviewCats, heartHits, nameKwHits, kwHits, reHits, hideOnlyReHits, allHideOnlyReHits } = matchInfo;
       if (isProtectedVerified) clearProtectedVerifiedArticleState(art);
       else setArticleHideRuleStats(art, { nameKwHits, kwHits, reHits, hideOnlyReHits });
       const alreadyBlocked = blockedHandles.has(normalizeHandle(handle));
       const isOP = isMainTweetArticle(art);
-      art.dataset.xfsHideMatched = (!isOP && matched && !alreadyBlocked) ? '1' : '0';
+      art.dataset.xfsHideMatched = (!isOP && actionableMatched && !alreadyBlocked) ? '1' : '0';
       if (alreadyBlocked) art.dataset.xfsReferralAccount = '0';
       else if (!isProtectedVerified) scheduleReferralCheck(art, handle, isOP, displayName);
-      if (!isOP && actionableMatched && !alreadyBlocked && /\/status\/\d/.test(location.pathname)) {
+      if (!isOP && (actionableMatched || reviewCats.size > 0) && !alreadyBlocked && /\/status\/\d/.test(location.pathname)) {
         matchedHandlesInView.add(handle);
         if (!matchedUsersCache.has(handle))
-          matchedUsersCache.set(handle, { handle, displayName, cats: actionableCats, heartHits: [...heartHits], nameKwHits: [...nameKwHits], kwHits: [...kwHits], reHits: [...reHits], hideOnlyReHits: [...hideOnlyReHits], tweetSnippet });
+          matchedUsersCache.set(handle, { handle, displayName, cats: actionableCats, reviewCats: new Set(reviewCats), heartHits: [...heartHits], nameKwHits: [...nameKwHits], kwHits: [...kwHits], reHits: [...reHits], hideOnlyReHits: [...hideOnlyReHits], tweetSnippet });
         maybeAutoQueueBrowseMatchedUser({
           handle,
           displayName,
-          cats: actionableCats,
+          cats: new Set([...actionableCats, ...reviewCats]),
+          reviewCats: new Set(reviewCats),
           heartHits: [...heartHits],
           nameKwHits: [...nameKwHits],
           kwHits: [...kwHits],
