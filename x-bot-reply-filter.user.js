@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X Bot Reply Filter
 // @namespace    local.x.bot.reply.filter
-// @version      0.2.2
+// @version      0.2.3
 // @description  Hide likely bot/spam replies on X with conservative local scoring and local block/mute logs.
 // @match        https://x.com/*
 // @match        https://twitter.com/*
@@ -19,6 +19,8 @@
   const RULES_KEY = "x_bot_reply_filter_rules_v1";
   const STATS_KEY = "x_bot_reply_filter_stats_v1";
   const TIME_SETTINGS_KEY = "x_bot_reply_filter_time_settings_v1";
+  const UI_POS_KEY = "x_bot_reply_filter_ui_pos_v1";
+  const UI_COLLAPSED_KEY = "x_bot_reply_filter_ui_collapsed_v1";
   const WHITELIST_KEY = "x_bot_reply_filter_whitelist_v1";
   const HIDDEN_ATTR = "data-x-bot-reply-filter-hidden";
   const TWEET_SELECTOR = 'article[data-testid="tweet"]';
@@ -44,6 +46,7 @@
     logPanel: null,
     queuePanel: null,
     rulesPanel: null,
+    toolbarCollapsed: false,
     lastMenuArticle: null,
     lastMenuArticleAt: 0,
     loggedKeys: new Set(),
@@ -211,6 +214,21 @@
 
   function saveJson(key, value) {
     localStorage.setItem(key, JSON.stringify(value));
+  }
+
+  function loadUiPosition() {
+    const pos = loadJson(UI_POS_KEY, {});
+    return {
+      right: validPositiveNumber(pos.right, 18),
+      bottom: validPositiveNumber(pos.bottom, 160),
+    };
+  }
+
+  function saveUiPosition(pos) {
+    saveJson(UI_POS_KEY, {
+      right: validPositiveNumber(pos.right, 18),
+      bottom: validPositiveNumber(pos.bottom, 160),
+    });
   }
 
   function validPositiveNumber(value, fallback) {
@@ -961,13 +979,13 @@
     const logs = loadLogs();
     const body = state.logPanel.querySelector("[data-role='log-body']");
     const count = state.logPanel.querySelector("[data-role='log-count']");
-    count.textContent = `${logs.length} logs`;
+    count.textContent = `${logs.length} 条`;
     body.innerHTML = "";
 
     if (!logs.length) {
       const empty = document.createElement("div");
       empty.className = "xbrf-empty";
-      empty.textContent = "No logs yet";
+      empty.textContent = "暂无日志";
       body.appendChild(empty);
       return;
     }
@@ -992,7 +1010,7 @@
       url.href = item.url || item.page || "#";
       url.target = "_blank";
       url.rel = "noreferrer";
-      url.textContent = "Open";
+      url.textContent = "打开原文";
 
       row.append(meta, reason, text, url);
       body.appendChild(row);
@@ -1005,13 +1023,13 @@
     state.logPanel.id = "x-bot-reply-filter-log-panel";
     state.logPanel.innerHTML = `
       <div class="xbrf-log-head">
-        <strong>Filter logs</strong>
+        <strong>过滤日志</strong>
         <span data-role="log-count"></span>
       </div>
       <div class="xbrf-log-actions">
-        <button type="button" data-action="export-logs">Export</button>
-        <button type="button" data-action="clear-logs">Clear</button>
-        <button type="button" data-action="close-logs">Close</button>
+        <button type="button" data-action="export-logs">导出</button>
+        <button type="button" data-action="clear-logs">清空</button>
+        <button type="button" data-action="close-logs">关闭</button>
       </div>
       <div data-role="log-body" class="xbrf-log-body"></div>
     `;
@@ -1035,21 +1053,21 @@
     const nextDelay = state.queuePanel.querySelector("[data-role='next-delay']");
     const autoStatus = state.queuePanel.querySelector("[data-role='auto-status']");
     const pendingCount = queue.filter((item) => item.status === "pending").length;
-    count.textContent = `${pendingCount} pending`;
+    count.textContent = `${pendingCount} 待处理`;
     state.queuePanel.querySelector("[data-role='base-interval']").value = timeSettings.baseIntervalSec;
     state.queuePanel.querySelector("[data-role='pause-20']").value = timeSettings.pauseEvery20Sec;
     state.queuePanel.querySelector("[data-role='pause-60']").value = timeSettings.pauseEvery60Min;
     state.queuePanel.querySelector("[data-role='max-run']").value = timeSettings.maxRunMinutes;
     autoStatus.textContent = state.autoBlockRunning
-      ? `Auto block running, ${state.autoBlockProcessed} done this run`
-      : "Auto block stopped";
-    nextDelay.textContent = `Base ${timeSettings.baseIntervalSec}s | 20 pause ${timeSettings.pauseEvery20Sec}s | 60 pause ${timeSettings.pauseEvery60Min}m`;
+      ? `自动拉黑运行中，本轮已处理 ${state.autoBlockProcessed}`
+      : "自动拉黑已停止";
+    nextDelay.textContent = `基础 ${timeSettings.baseIntervalSec}s | 每20个停 ${timeSettings.pauseEvery20Sec}s | 每60个停 ${timeSettings.pauseEvery60Min}m`;
     body.innerHTML = "";
 
     if (!queue.length) {
       const empty = document.createElement("div");
       empty.className = "xbrf-empty";
-      empty.textContent = "No queued accounts";
+      empty.textContent = "暂无排队账号";
       body.appendChild(empty);
       return;
     }
@@ -1083,9 +1101,9 @@
       const actions = document.createElement("div");
       actions.className = "xbrf-inline-actions";
       actions.innerHTML = `
-        <button type="button" data-action="mark-blocked" data-handle="${item.handle || ""}">Mark blocked</button>
-        <button type="button" data-action="retry-queue" data-handle="${item.handle || ""}">Retry</button>
-        <button type="button" data-action="remove-queue" data-handle="${item.handle || ""}">Remove</button>
+        <button type="button" data-action="mark-blocked" data-handle="${item.handle || ""}">标记已拉黑</button>
+        <button type="button" data-action="retry-queue" data-handle="${item.handle || ""}">重试</button>
+        <button type="button" data-action="remove-queue" data-handle="${item.handle || ""}">移除</button>
       `;
 
       row.append(meta, reason, text, actions);
@@ -1099,29 +1117,29 @@
     state.queuePanel.id = "x-bot-reply-filter-queue-panel";
     state.queuePanel.innerHTML = `
       <div class="xbrf-log-head">
-        <strong>Block review queue</strong>
+        <strong>拉黑排队</strong>
         <span data-role="queue-count"></span>
       </div>
       <div class="xbrf-log-actions">
-        <button type="button" data-action="start-auto-block">Start auto block</button>
-        <button type="button" data-action="stop-auto-block">Stop</button>
-        <button type="button" data-action="clear-completed">Clear done</button>
-        <button type="button" data-action="close-queue">Close</button>
+        <button type="button" data-action="start-auto-block">开始自动拉黑</button>
+        <button type="button" data-action="stop-auto-block">停止</button>
+        <button type="button" data-action="clear-completed">清理完成项</button>
+        <button type="button" data-action="close-queue">关闭</button>
       </div>
       <div class="xbrf-time-settings">
-        <label>Base interval, seconds
+        <label>基础间隔（秒）
           <input type="number" step="any" data-role="base-interval">
         </label>
-        <label>Pause every 20, seconds
+        <label>每20个暂停（秒）
           <input type="number" step="any" data-role="pause-20">
         </label>
-        <label>Pause every 60, minutes
+        <label>每60个暂停（分钟）
           <input type="number" step="any" data-role="pause-60">
         </label>
-        <label>Max run, minutes
+        <label>最长运行（分钟）
           <input type="number" step="any" data-role="max-run">
         </label>
-        <button type="button" data-action="save-time-settings">Save time</button>
+        <button type="button" data-action="save-time-settings">保存时间</button>
         <span data-role="auto-status"></span>
         <span data-role="next-delay"></span>
       </div>
@@ -1173,7 +1191,7 @@
     const rows = Object.entries(stats).sort((a, b) => b[1] - a[1]).slice(0, 80);
     statsBody.textContent = rows.length
       ? rows.map(([key, count]) => `${count}  ${key}`).join("\n")
-      : "No rule hits yet";
+      : "暂无命中统计";
   }
 
   function ensureRulesPanel() {
@@ -1182,20 +1200,20 @@
     state.rulesPanel.id = "x-bot-reply-filter-rules-panel";
     state.rulesPanel.innerHTML = `
       <div class="xbrf-log-head">
-        <strong>Rules</strong>
-        <span>one item per line</span>
+        <strong>关键词规则</strong>
+        <span>每行一条</span>
       </div>
       <div class="xbrf-rules-grid">
-        <label>Content keywords<textarea data-role="content-rules"></textarea></label>
-        <label>Name keywords<textarea data-role="name-rules"></textarea></label>
-        <label>Regex rules<textarea data-role="regex-rules"></textarea></label>
+        <label>内容关键词<textarea data-role="content-rules"></textarea></label>
+        <label>用户名关键词<textarea data-role="name-rules"></textarea></label>
+        <label>正则规则<textarea data-role="regex-rules"></textarea></label>
       </div>
       <div class="xbrf-log-actions">
-        <button type="button" data-action="save-rules">Save</button>
-        <button type="button" data-action="export-rules">Export</button>
-        <button type="button" data-action="import-rules">Import</button>
-        <button type="button" data-action="reset-rules">Reset</button>
-        <button type="button" data-action="close-rules">Close</button>
+        <button type="button" data-action="save-rules">保存</button>
+        <button type="button" data-action="export-rules">导出</button>
+        <button type="button" data-action="import-rules">导入</button>
+        <button type="button" data-action="reset-rules">重置</button>
+        <button type="button" data-action="close-rules">关闭</button>
       </div>
       <pre data-role="stats-body" class="xbrf-stats"></pre>
     `;
@@ -1246,121 +1264,125 @@
 
   function renderPanel() {
     if (!state.panel) {
+      state.toolbarCollapsed = localStorage.getItem(UI_COLLAPSED_KEY) === "1";
+      const uiPos = loadUiPosition();
       state.panel = document.createElement("div");
       state.panel.id = "x-bot-reply-filter-panel";
       state.panel.innerHTML = `
-        <button type="button" data-action="toggle"></button>
-        <span data-role="count"></span>
-        <button type="button" data-action="reveal">Show</button>
-        <button type="button" data-action="queue">Queue</button>
-        <button type="button" data-action="rules">Rules</button>
-        <button type="button" data-action="logs">Logs</button>
+        <button type="button" class="xbrf-tool-main" data-action="collapse" title="收起/展开工具栏">XBF</button>
+        <div class="xbrf-tool-stack">
+          <button type="button" data-action="toggle" title="开启/关闭隐藏"></button>
+          <button type="button" data-action="reveal" title="临时显示被隐藏回复">显</button>
+          <button type="button" data-action="queue" title="拉黑队列">队</button>
+          <button type="button" data-action="rules" title="关键词和正则">规</button>
+          <button type="button" data-action="logs" title="日志">志</button>
+        </div>
+        <span data-role="count" class="xbrf-count"></span>
       `;
+      state.panel.style.right = `${uiPos.right}px`;
+      state.panel.style.bottom = `${uiPos.bottom}px`;
       document.documentElement.appendChild(state.panel);
 
       const style = document.createElement("style");
       style.textContent = `
         #x-bot-reply-filter-panel {
           position: fixed;
-          right: 14px;
-          bottom: 14px;
           z-index: 2147483647;
           display: flex;
+          flex-direction: column;
           align-items: center;
-          gap: 8px;
-          padding: 8px;
-          border: 1px solid rgba(127,127,127,.35);
-          border-radius: 8px;
-          background: rgba(20,20,20,.88);
-          color: #fff;
-          font: 13px/1.2 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-          box-shadow: 0 4px 18px rgba(0,0,0,.25);
+          gap: 7px;
+          width: 44px;
+          padding: 7px 5px;
+          border: 1.5px solid rgba(207,217,222,.92);
+          border-radius: 24px;
+          background: rgba(255,255,255,.84);
+          color: #0f1419;
+          font: 12px/1.2 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+          box-shadow: 0 4px 18px rgba(15,20,25,.16);
+          backdrop-filter: blur(6px);
+          -webkit-backdrop-filter: blur(6px);
+          user-select: none;
         }
-        #x-bot-reply-filter-panel button,
-        #x-bot-reply-filter-log-panel button {
-          border: 0;
-          border-radius: 6px;
-          padding: 6px 9px;
+        #x-bot-reply-filter-panel.xbrf-collapsed .xbrf-tool-stack,
+        #x-bot-reply-filter-panel.xbrf-collapsed .xbrf-count {
+          display: none;
+        }
+        #x-bot-reply-filter-panel button {
+          width: 34px;
+          height: 34px;
+          border: 1px solid #cfd9de;
+          border-radius: 999px;
+          padding: 0;
           background: #fff;
-          color: #111;
-          font: inherit;
+          color: #536471;
+          font: 700 12px/32px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
           cursor: pointer;
+          text-align: center;
+          box-shadow: 0 2px 8px rgba(15,20,25,.10);
+          transition: transform .15s, box-shadow .15s, background .15s, color .15s;
         }
-        #x-bot-reply-filter-panel [data-role="count"] {
-          min-width: 74px;
+        #x-bot-reply-filter-panel button:hover {
+          transform: scale(1.06);
+          box-shadow: 0 3px 12px rgba(15,20,25,.18);
+        }
+        #x-bot-reply-filter-panel .xbrf-tool-main {
+          color: #fff;
+          background: #1d9bf0;
+          border-color: #1d9bf0;
+          cursor: grab;
+        }
+        #x-bot-reply-filter-panel .xbrf-tool-stack {
+          display: flex;
+          flex-direction: column;
+          gap: 7px;
+          align-items: center;
+        }
+        #x-bot-reply-filter-panel .xbrf-count {
+          min-width: 18px;
+          height: 18px;
+          padding: 0 5px;
+          border-radius: 9px;
+          background: #f4212e;
+          color: #fff;
+          font-size: 10px;
+          font-weight: 800;
+          line-height: 18px;
           text-align: center;
         }
-        #x-bot-reply-filter-log-panel {
-          position: fixed;
-          right: 14px;
-          bottom: 62px;
-          z-index: 2147483647;
-          width: min(560px, calc(100vw - 28px));
-          max-height: min(620px, calc(100vh - 90px));
-          display: none;
-          overflow: hidden;
-          border: 1px solid rgba(127,127,127,.35);
-          border-radius: 8px;
-          background: rgba(18,18,18,.96);
-          color: #fff;
-          font: 13px/1.35 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-          box-shadow: 0 8px 28px rgba(0,0,0,.35);
-        }
-        #x-bot-reply-filter-log-panel .xbrf-log-head,
-        #x-bot-reply-filter-log-panel .xbrf-log-actions {
-          display: flex;
-          align-items: center;
-          justify-content: space-between;
-          gap: 8px;
-          padding: 10px;
-          border-bottom: 1px solid rgba(255,255,255,.12);
-        }
-        #x-bot-reply-filter-log-panel .xbrf-log-actions {
-          justify-content: flex-end;
-        }
-        #x-bot-reply-filter-log-panel .xbrf-log-body {
-          max-height: 500px;
-          overflow: auto;
-          padding: 10px;
-        }
-        #x-bot-reply-filter-log-panel .xbrf-log-row {
-          padding: 10px 0;
-          border-bottom: 1px solid rgba(255,255,255,.1);
-        }
-        #x-bot-reply-filter-log-panel .xbrf-log-meta {
-          color: #ddd;
-          font-weight: 600;
-        }
-        #x-bot-reply-filter-log-panel .xbrf-log-reason {
-          color: #f6c35b;
-          margin-top: 3px;
-        }
-        #x-bot-reply-filter-log-panel .xbrf-log-text {
-          color: #fff;
-          margin: 6px 0;
-          white-space: pre-wrap;
-          word-break: break-word;
-        }
-        #x-bot-reply-filter-log-panel a {
-          color: #9fd1ff;
-        }
+        #x-bot-reply-filter-log-panel,
         #x-bot-reply-filter-queue-panel,
         #x-bot-reply-filter-rules-panel {
           position: fixed;
-          right: 14px;
-          bottom: 62px;
+          right: 74px;
+          bottom: 118px;
           z-index: 2147483647;
-          width: min(620px, calc(100vw - 28px));
+          width: min(720px, calc(100vw - 96px));
           max-height: min(700px, calc(100vh - 90px));
           display: none;
           overflow: hidden;
-          border: 1px solid rgba(127,127,127,.35);
-          border-radius: 8px;
-          background: rgba(18,18,18,.96);
-          color: #fff;
+          border: 1px solid #cfd9de;
+          border-radius: 12px;
+          background: rgba(255,255,255,.96);
+          color: #0f1419;
           font: 13px/1.35 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-          box-shadow: 0 8px 28px rgba(0,0,0,.35);
+          box-shadow: 0 8px 28px rgba(15,20,25,.18);
+          backdrop-filter: blur(6px);
+          -webkit-backdrop-filter: blur(6px);
         }
+        #x-bot-reply-filter-log-panel button,
+        #x-bot-reply-filter-queue-panel button,
+        #x-bot-reply-filter-rules-panel button {
+          border: 1px solid #cfd9de;
+          border-radius: 8px;
+          padding: 4px 10px;
+          background: #fff;
+          color: #0f1419;
+          font: 600 12px/18px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+          cursor: pointer;
+        }
+        #x-bot-reply-filter-log-panel .xbrf-log-head,
+        #x-bot-reply-filter-log-panel .xbrf-log-actions,
         #x-bot-reply-filter-queue-panel .xbrf-log-head,
         #x-bot-reply-filter-queue-panel .xbrf-log-actions,
         #x-bot-reply-filter-rules-panel .xbrf-log-head,
@@ -1369,18 +1391,43 @@
           align-items: center;
           justify-content: space-between;
           gap: 8px;
-          padding: 10px;
-          border-bottom: 1px solid rgba(255,255,255,.12);
+          padding: 10px 12px;
+          border-bottom: 1px solid #eff3f4;
         }
         #x-bot-reply-filter-queue-panel .xbrf-log-actions,
+        #x-bot-reply-filter-log-panel .xbrf-log-actions,
         #x-bot-reply-filter-rules-panel .xbrf-log-actions {
           justify-content: flex-end;
           flex-wrap: wrap;
         }
+        #x-bot-reply-filter-log-panel .xbrf-log-body,
         #x-bot-reply-filter-queue-panel .xbrf-log-body {
-          max-height: 560px;
+          max-height: 500px;
           overflow: auto;
-          padding: 10px;
+          padding: 10px 12px;
+        }
+        #x-bot-reply-filter-log-panel .xbrf-log-row,
+        #x-bot-reply-filter-queue-panel .xbrf-log-row {
+          padding: 9px 0;
+          border-bottom: 1px dashed #cfd9de;
+        }
+        #x-bot-reply-filter-log-panel .xbrf-log-meta,
+        #x-bot-reply-filter-queue-panel .xbrf-log-meta {
+          color: #0f1419;
+          font-weight: 700;
+        }
+        #x-bot-reply-filter-log-panel .xbrf-log-reason,
+        #x-bot-reply-filter-queue-panel .xbrf-log-reason {
+          color: #d65f00;
+          margin-top: 3px;
+          font-size: 12px;
+        }
+        #x-bot-reply-filter-log-panel .xbrf-log-text,
+        #x-bot-reply-filter-queue-panel .xbrf-log-text {
+          color: #0f1419;
+          margin: 6px 0;
+          white-space: pre-wrap;
+          word-break: break-word;
         }
         #x-bot-reply-filter-queue-panel .xbrf-inline-actions {
           display: flex;
@@ -1392,31 +1439,32 @@
           grid-template-columns: repeat(4, minmax(110px, 1fr));
           gap: 8px;
           align-items: end;
-          padding: 10px;
-          border-bottom: 1px solid rgba(255,255,255,.12);
+          padding: 10px 12px;
+          border-bottom: 1px solid #eff3f4;
         }
         #x-bot-reply-filter-queue-panel .xbrf-time-settings label {
           display: flex;
           flex-direction: column;
           gap: 4px;
-          color: #ddd;
+          color: #536471;
           font-size: 12px;
         }
         #x-bot-reply-filter-queue-panel .xbrf-time-settings input {
           min-width: 0;
-          border: 1px solid rgba(255,255,255,.16);
+          border: 1px solid #cfd9de;
           border-radius: 6px;
           padding: 6px;
-          background: #080808;
-          color: #fff;
+          background: #fff;
+          color: #0f1419;
           font: inherit;
         }
         #x-bot-reply-filter-queue-panel .xbrf-time-settings span {
-          color: #cfcfcf;
+          color: #536471;
           font-size: 12px;
         }
+        #x-bot-reply-filter-log-panel a,
         #x-bot-reply-filter-queue-panel a {
-          color: #9fd1ff;
+          color: #1d9bf0;
         }
         #x-bot-reply-filter-rules-panel .xbrf-rules-grid {
           display: grid;
@@ -1428,17 +1476,17 @@
           display: flex;
           flex-direction: column;
           gap: 6px;
-          color: #ddd;
+          color: #536471;
           font-weight: 600;
         }
         #x-bot-reply-filter-rules-panel textarea {
           min-height: 160px;
           resize: vertical;
-          border: 1px solid rgba(255,255,255,.16);
+          border: 1px solid #cfd9de;
           border-radius: 6px;
           padding: 8px;
-          background: #080808;
-          color: #fff;
+          background: #fff;
+          color: #0f1419;
           font: 12px/1.35 ui-monospace, SFMono-Regular, Consolas, monospace;
         }
         #x-bot-reply-filter-rules-panel .xbrf-stats {
@@ -1446,8 +1494,8 @@
           overflow: auto;
           margin: 0;
           padding: 10px;
-          border-top: 1px solid rgba(255,255,255,.12);
-          color: #cfcfcf;
+          border-top: 1px solid #eff3f4;
+          color: #536471;
           white-space: pre-wrap;
           font: 12px/1.35 ui-monospace, SFMono-Regular, Consolas, monospace;
         }
@@ -1458,7 +1506,7 @@
           }
         }
         #x-bot-reply-filter-log-panel .xbrf-empty {
-          color: #aaa;
+          color: #536471;
           padding: 10px 0;
         }
         .xbrf-hidden-card {
@@ -1529,9 +1577,61 @@
       ensureQueuePanel();
       ensureRulesPanel();
 
+      const syncToolbar = () => {
+        state.panel.classList.toggle("xbrf-collapsed", state.toolbarCollapsed);
+      };
+      syncToolbar();
+
+      let drag = null;
+      state.panel.querySelector(".xbrf-tool-main").addEventListener("pointerdown", (event) => {
+        if (event.button !== 0) return;
+        drag = {
+          x: event.clientX,
+          y: event.clientY,
+          right: Number.parseFloat(state.panel.style.right) || 18,
+          bottom: Number.parseFloat(state.panel.style.bottom) || 160,
+          moved: false,
+        };
+        state.panel.querySelector(".xbrf-tool-main").setPointerCapture?.(event.pointerId);
+      });
+      state.panel.querySelector(".xbrf-tool-main").addEventListener("pointermove", (event) => {
+        if (!drag) return;
+        const dx = event.clientX - drag.x;
+        const dy = event.clientY - drag.y;
+        if (Math.abs(dx) > 4 || Math.abs(dy) > 4) drag.moved = true;
+        const nextRight = Math.max(6, drag.right - dx);
+        const nextBottom = Math.max(6, drag.bottom - dy);
+        state.panel.style.right = `${nextRight}px`;
+        state.panel.style.bottom = `${nextBottom}px`;
+      });
+      state.panel.querySelector(".xbrf-tool-main").addEventListener("pointerup", (event) => {
+        if (!drag) return;
+        state.panel.querySelector(".xbrf-tool-main").releasePointerCapture?.(event.pointerId);
+        const wasDrag = drag.moved;
+        state.panel.dataset.xbrfDragged = wasDrag ? "1" : "0";
+        saveUiPosition({
+          right: Number.parseFloat(state.panel.style.right) || 18,
+          bottom: Number.parseFloat(state.panel.style.bottom) || 160,
+        });
+        drag = null;
+        if (wasDrag) {
+          event.preventDefault();
+          event.stopPropagation();
+        }
+      });
+
       state.panel.addEventListener("click", (event) => {
         const button = event.target.closest("button");
         if (!button) return;
+        if (button.dataset.action === "collapse") {
+          if (state.panel.dataset.xbrfDragged === "1") {
+            state.panel.dataset.xbrfDragged = "0";
+            return;
+          }
+          state.toolbarCollapsed = !state.toolbarCollapsed;
+          localStorage.setItem(UI_COLLAPSED_KEY, state.toolbarCollapsed ? "1" : "0");
+          syncToolbar();
+        }
         if (button.dataset.action === "toggle") {
           config.enabled = !config.enabled;
           scan();
@@ -1542,25 +1642,26 @@
         if (button.dataset.action === "logs") {
           ensureLogPanel();
           renderLogPanel();
-          state.logPanel.style.display = state.logPanel.style.display === "none" ? "block" : "none";
+          state.logPanel.style.display = getComputedStyle(state.logPanel).display === "none" ? "block" : "none";
         }
         if (button.dataset.action === "queue") {
           ensureQueuePanel();
           renderQueuePanel();
-          state.queuePanel.style.display = state.queuePanel.style.display === "none" ? "block" : "none";
+          state.queuePanel.style.display = getComputedStyle(state.queuePanel).display === "none" ? "block" : "none";
         }
         if (button.dataset.action === "rules") {
           ensureRulesPanel();
           renderRulesPanel();
-          state.rulesPanel.style.display = state.rulesPanel.style.display === "none" ? "block" : "none";
+          state.rulesPanel.style.display = getComputedStyle(state.rulesPanel).display === "none" ? "block" : "none";
         }
       });
     }
 
     const toggle = state.panel.querySelector('[data-action="toggle"]');
     const count = state.panel.querySelector('[data-role="count"]');
-    toggle.textContent = config.enabled ? "Filter on" : "Filter off";
-    count.textContent = `${state.hiddenCount} hidden`;
+    toggle.textContent = config.enabled ? "隐" : "停";
+    toggle.title = config.enabled ? "过滤已开启" : "过滤已暂停";
+    count.textContent = `${state.hiddenCount}`;
   }
 
   function rememberMenuArticle(event) {
