@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         垃圾推号大扫除 - 自用版
 // @namespace    http://tampermonkey.net/
-// @version      6.17.7
+// @version      6.17.8
 // @description  扫描推文回复中的垃圾用户批量拉黑
 // @author       summeriscoming
 // @license MIT
@@ -3531,7 +3531,7 @@
     const panelW = colsNeeded * COL_W;
     const panelDefaultH = Math.min(Math.max(360, window.innerHeight - 110), Math.max(260, window.innerHeight - 16));
     const freeSize = isGlobalQueueView
-      ? readFloatingPanelSize(RESULT_PANEL_SIZE_KEY, {
+      ? readFloatingPanelSize(GLOBAL_BLOCK_QUEUE_SIZE_KEY, {
         width: Math.min(Math.max(520, panelW), Math.max(360, window.innerWidth - 24)),
         height: panelDefaultH,
       })
@@ -3539,10 +3539,13 @@
     const initialPanelW = freeSize ? Math.min(freeSize.width, Math.max(360, window.innerWidth - 16)) : panelW;
     const initialPanelH = freeSize ? Math.min(freeSize.height, Math.max(260, window.innerHeight - 16)) : 220;
     const panelPos = clampFloatingPanelPosition(
-      readFloatingPanelPosition(RESULT_PANEL_POS_KEY, { left: 0, top: 53 }),
+      isGlobalQueueView
+        ? readGlobalBlockQueuePosition()
+        : readFloatingPanelPosition(RESULT_PANEL_POS_KEY, { left: 0, top: 53 }),
       initialPanelW,
       initialPanelH
     );
+    const panelPosKey = isGlobalQueueView ? GLOBAL_BLOCK_QUEUE_POS_KEY : RESULT_PANEL_POS_KEY;
 
     // Panel — flush left edge, adaptive width, semi-transparent
     const panel = document.createElement('div');
@@ -3571,14 +3574,14 @@
     // ── Header ──
     const hdr = document.createElement('div');
     hdr.style.cssText = `padding:6px 12px;border-bottom:1px solid ${C.border};display:flex;align-items:center;gap:8px;flex-shrink:0;`;
-    makeDraggableFloatingPanel(panel, hdr, RESULT_PANEL_POS_KEY, {
+    makeDraggableFloatingPanel(panel, hdr, panelPosKey, {
       width: () => panel.offsetWidth || initialPanelW,
       height: () => panel.offsetHeight || initialPanelH,
       onMove: pos => {
         if (!isGlobalQueueView) panel.style.height = `calc(100vh - ${pos.top}px)`;
       },
       onEnd: () => {
-        if (isGlobalQueueView) writeFloatingPanelSize(RESULT_PANEL_SIZE_KEY, {
+        if (isGlobalQueueView) writeFloatingPanelSize(GLOBAL_BLOCK_QUEUE_SIZE_KEY, {
           width: panel.offsetWidth,
           height: panel.offsetHeight,
         });
@@ -4456,11 +4459,11 @@
         syncColumnHeight();
         clearTimeout(resizeSaveTimer);
         resizeSaveTimer = setTimeout(() => {
-          writeFloatingPanelSize(RESULT_PANEL_SIZE_KEY, {
+          writeFloatingPanelSize(GLOBAL_BLOCK_QUEUE_SIZE_KEY, {
             width: panel.offsetWidth,
             height: panel.offsetHeight,
           });
-          writeFloatingPanelPosition(RESULT_PANEL_POS_KEY, {
+          writeGlobalBlockQueuePosition({
             left: panel.offsetLeft,
             top: panel.offsetTop,
           });
