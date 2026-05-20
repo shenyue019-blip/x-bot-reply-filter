@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         垃圾推号大扫除 - 自用版
 // @namespace    http://tampermonkey.net/
-// @version      6.17.5
+// @version      6.17.6
 // @description  扫描推文回复中的垃圾用户批量拉黑
 // @author       summeriscoming
 // @license MIT
