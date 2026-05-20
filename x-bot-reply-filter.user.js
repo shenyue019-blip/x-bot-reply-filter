@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         垃圾推号大扫除 - 自用版
 // @namespace    http://tampermonkey.net/
-// @version      6.18.3
+// @version      6.18.4
 // @description  扫描推文回复中的垃圾用户批量拉黑
 // @author       summeriscoming
 // @license MIT
@@ -551,6 +551,7 @@
   const GLOBAL_BLOCK_QUEUE_ROUND_KEY = 'global_block_queue_round_v1';
   const GLOBAL_BLOCK_QUEUE_LOCK_TTL = 15000;
   const GLOBAL_BLOCK_QUEUE_DONE_MAX = 300;
+  const GLOBAL_BLOCK_QUEUE_FAILED_RETRY_MS = 8000;
   const GLOBAL_BLOCK_HISTORY_MAX = 5000;
   const GLOBAL_BLOCK_QUEUE_SHORT_COOLDOWN_EVERY = 20;
   const GLOBAL_BLOCK_QUEUE_SHORT_COOLDOWN = 30000;
@@ -3383,6 +3384,9 @@
       if (item?.status === 'running' && now - Number(item.updatedAt || 0) > GLOBAL_BLOCK_QUEUE_LOCK_TTL * 2) {
         q.items[key] = { ...item, status: 'queued', updatedAt: now, error: 'worker expired' };
         changed = true;
+      } else if (item?.status === 'failed' && now - Number(item.updatedAt || 0) > GLOBAL_BLOCK_QUEUE_FAILED_RETRY_MS) {
+        q.items[key] = { ...item, status: 'queued', updatedAt: now, error: '' };
+        changed = true;
       }
     });
     if (changed) writeGlobalBlockQueue(q);
@@ -3795,7 +3799,8 @@
 
   function maybeStartGlobalBlockQueueWorker() {
     if (globalQueueWorkerActive || globalBlockQueuePaused()) return;
-    const hasQueued = globalBlockQueueItems().some(item => item.status === 'queued');
+    const q = recoverStaleGlobalBlockQueueItems();
+    const hasQueued = globalBlockQueueItems(q).some(item => item.status === 'queued');
     if (hasQueued) setTimeout(processGlobalBlockQueue, 0);
   }
 
