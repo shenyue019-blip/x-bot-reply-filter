@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         垃圾推号大扫除 - 自用版
 // @namespace    http://tampermonkey.net/
-// @version      6.17.6
+// @version      6.17.7
 // @description  扫描推文回复中的垃圾用户批量拉黑
 // @author       summeriscoming
 // @license MIT
@@ -5316,8 +5316,8 @@
     if (!minimized) {
       const panel = document.getElementById('xfs-panel');
       if (panel?.dataset.xfsGlobalQueueView === '1') return;
-      GM_setValue(GLOBAL_BLOCK_QUEUE_MINIMIZED_KEY, true);
-      setTimeout(updateGlobalBlockQueuePanel, 0);
+      if (globalQueuePanelSuppressed) return;
+      showGlobalBlockQueueDetailPanel(false);
       return;
     }
     const detailPanel = document.getElementById('xfs-panel');
@@ -5462,7 +5462,7 @@
       ['xfs-referral-scan-btn', 240, 0],
       ['xfs-referral-btn', 280, 0],
       ['xfs-sweep-btn', 320, 0],
-      ['xfs-queue-btn', 340, 0],
+      ['xfs-queue-btn', 320, 40],
       ['xfs-btn', 360, 0],
       ['xfs-hide-btn', 400, 0],
       ['xfs-btn-backdrop', 196, -4],
@@ -6910,7 +6910,7 @@
     }
     if (!document.getElementById('xfs-queue-btn')) {
       document.body.appendChild(mkIconBtn(
-        'xfs-queue-btn', QUEUE_SVG, '打开拉黑排队卡片', 340, C.blockRed, () => {
+        'xfs-queue-btn', QUEUE_SVG, '打开拉黑排队卡片', 320, C.blockRed, () => {
           globalQueuePanelSuppressed = false;
           showGlobalBlockQueueDetailPanel(true);
         }));
