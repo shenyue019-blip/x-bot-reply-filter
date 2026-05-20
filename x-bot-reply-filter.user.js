@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         垃圾推号大扫除 - 自用版
 // @namespace    http://tampermonkey.net/
-// @version      6.18.13
+// @version      6.18.14
 // @description  扫描推文回复中的垃圾用户批量拉黑
 // @author       summeriscoming
 // @license MIT
@@ -3320,7 +3320,12 @@
       return `状态：冷却中 · 剩余 ${formatGlobalQueueCooldown(cooldownRemaining)} · ${round.reason || '队列冷却'} · 队列 ${counts.queued}`;
     }
     if (counts.running) return `状态：执行中 · 正在拉黑 ${counts.running} · 队列 ${counts.queued}`;
-    if (counts.queued) return `状态：等待执行 · 队列 ${counts.queued}`;
+    if (counts.queued) {
+      const lock = globalBlockQueueLockState();
+      if (lock.locked && !lock.stale) return `状态：等待其他标签页执行 · 队列 ${counts.queued}`;
+      if (lock.locked && lock.stale) return `状态：等待恢复 · 检测到过期锁 · 队列 ${counts.queued}`;
+      return `状态：等待执行 · 队列 ${counts.queued}`;
+    }
     return `状态：空闲 · 完成 ${counts.done} · 失败 ${counts.failed}`;
   }
 
@@ -4058,6 +4063,76 @@
     if (cur?.tabId === globalQueueTabId) GM_setValue(GLOBAL_BLOCK_QUEUE_LOCK_KEY, null);
   }
 
+  function globalBlockQueueLockState() {
+    const cur = GM_getValue(GLOBAL_BLOCK_QUEUE_LOCK_KEY, null);
+    const now = Date.now();
+    if (!cur || typeof cur !== 'object' || !cur.tabId) return { locked: false, stale: false, owner: '', expiresIn: 0, heartbeatAge: 0 };
+    const expiresIn = Number(cur.expiresAt || 0) - now;
+    const heartbeatAge = now - Number(cur.heartbeatAt || 0);
+    const stale = expiresIn <= 0 || heartbeatAge > GLOBAL_BLOCK_QUEUE_LOCK_TTL * 2 || expiresIn > GLOBAL_BLOCK_QUEUE_LOCK_TTL * 12;
+    return {
+      locked: true,
+      stale,
+      owner: String(cur.tabId || ''),
+      expiresIn,
+      heartbeatAge,
+    };
+  }
+
+  function clearStaleGlobalBlockQueueLock(force = false) {
+    const state = globalBlockQueueLockState();
+    if (!state.locked) return false;
+    if (!force && !state.stale) return false;
+    GM_setValue(GLOBAL_BLOCK_QUEUE_LOCK_KEY, null);
+    return true;
+  }
+
+  function repairGlobalBlockQueue(opts = {}) {
+    const now = Date.now();
+    const force = !!opts.force;
+    let q = recoverStaleGlobalBlockQueueItems(readGlobalBlockQueue());
+    let changed = false;
+    let recovered = 0;
+    Object.keys(q.items || {}).forEach(key => {
+      const item = q.items[key];
+      if (!item || !normalizeHandle(item.handle || key)) {
+        delete q.items[key];
+        changed = true;
+        return;
+      }
+      const status = item.status || 'queued';
+      if (status === 'running' && (force || now - Number(item.updatedAt || 0) > GLOBAL_BLOCK_QUEUE_LOCK_TTL)) {
+        q.items[key] = { ...item, status: 'queued', workerTab: '', error: force ? '手动恢复执行' : '执行超时，已恢复排队', updatedAt: now };
+        changed = true;
+        recovered += 1;
+      } else if (status === 'failed' && force) {
+        q.items[key] = { ...item, status: 'queued', error: '', updatedAt: now };
+        changed = true;
+        recovered += 1;
+      }
+    });
+    if (changed) writeGlobalBlockQueue(q);
+    const lockCleared = clearStaleGlobalBlockQueueLock(force);
+    const round = readGlobalQueueRound();
+    let cooldownCleared = false;
+    if (force && Number(round.cooldownUntil || 0) > Date.now()) {
+      writeGlobalQueueRound({ ...round, reason: '', cooldownStartedAt: 0, cooldownUntil: 0 });
+      cooldownCleared = true;
+    } else if (Number(round.cooldownUntil || 0) <= Date.now() && (round.reason || round.cooldownStartedAt || round.cooldownUntil)) {
+      writeGlobalQueueRound({ ...round, reason: '', cooldownStartedAt: 0, cooldownUntil: 0 });
+      cooldownCleared = true;
+    }
+    const lastBlockAt = parseInt(localStorage.getItem(LS_LAST_BLOCK) || '0', 10);
+    const lastBlockCleared = force && Number.isFinite(lastBlockAt) && lastBlockAt > Date.now() + 5 * 60 * 1000;
+    if (lastBlockCleared) localStorage.removeItem(LS_LAST_BLOCK);
+    if (force && globalBlockQueuePaused()) setGlobalBlockQueuePaused(false, { keepRound: true });
+    updateGlobalBlockQueuePanel();
+    refreshGlobalBlockQueueDetailPanel(q);
+    refreshGlobalQueueInlineButtons();
+    maybeStartGlobalBlockQueueWorker();
+    return { recovered, lockCleared, cooldownCleared, lastBlockCleared };
+  }
+
   function markHandleBlockedFromQueue(handle) {
     const key = normalizeHandle(handle);
     if (!key) return;
@@ -4193,6 +4268,7 @@
 
   function maybeStartGlobalBlockQueueWorker() {
     if (globalQueueWorkerActive || globalBlockQueuePaused()) return;
+    clearStaleGlobalBlockQueueLock(false);
     const q = recoverStaleGlobalBlockQueueItems();
     const hasQueued = globalBlockQueueItems(q).some(item => item.status === 'queued');
     if (hasQueued) setTimeout(processGlobalBlockQueue, 0);
@@ -5559,6 +5635,13 @@
         setGlobalBlockQueuePaused(!globalBlockQueuePaused());
         showGlobalBlockQueueDetailPanel();
       };
+      const repairBtn = mkBtn('恢复执行', false);
+      repairBtn.title = '清理过期锁、取消异常冷却，并把卡住/失败的账号重新排队执行';
+      repairBtn.onclick = () => {
+        const result = repairGlobalBlockQueue({ force: true });
+        showGlobalBlockQueueDetailPanel();
+        showToast(`已尝试恢复拉黑排队${result.recovered ? `：恢复 ${result.recovered} 个账号` : ''}`, false);
+      };
       const clearDoneBtn = mkBtn('清完成', false);
       clearDoneBtn.onclick = () => {
         clearCompletedGlobalBlockQueue();
@@ -5595,6 +5678,7 @@
       ftr.appendChild(refreshBtn);
       ftr.appendChild(doneToggleBtn);
       ftr.appendChild(pauseBtn);
+      ftr.appendChild(repairBtn);
       ftr.appendChild(clearDoneBtn);
       ftr.appendChild(clearQueueBtn);
       ftr.appendChild(closePanelBtn);
@@ -6696,6 +6780,15 @@
       }
       setGlobalBlockQueuePaused(!paused);
     };
+    const repairBtn = document.createElement('button');
+    repairBtn.type = 'button';
+    repairBtn.textContent = '恢复';
+    repairBtn.title = '清理过期锁、取消异常冷却，并重新执行卡住的排队项';
+    repairBtn.style.cssText = `border:1px solid ${C.blockRed};border-radius:7px;background:#fff;color:${C.blockRed};font-size:10px;font-weight:800;padding:3px 5px;cursor:pointer;width:100%;`;
+    repairBtn.onclick = () => {
+      const result = repairGlobalBlockQueue({ force: true });
+      showToast(`已尝试恢复拉黑排队${result.recovered ? `：恢复 ${result.recovered} 个账号` : ''}`, false);
+    };
     const minBtn = document.createElement('button');
     minBtn.type = 'button';
     minBtn.textContent = '展开';
@@ -6726,6 +6819,7 @@
     const actionGrid = document.createElement('div');
     actionGrid.style.cssText = 'display:grid;grid-template-columns:repeat(2, minmax(0, 1fr));gap:4px;';
     actionGrid.appendChild(resumeBtn);
+    actionGrid.appendChild(repairBtn);
     actionGrid.appendChild(minBtn);
     actionGrid.appendChild(settingsBtn);
     actionGrid.appendChild(clearDoneBtn);
