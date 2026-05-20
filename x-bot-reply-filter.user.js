@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X Bot Reply Filter
 // @namespace    local.x.bot.reply.filter
-// @version      0.2.5
+// @version      0.2.6
 // @description  Hide likely bot/spam replies on X with conservative local scoring and local block/mute logs.
 // @match        https://x.com/*
 // @match        https://twitter.com/*
@@ -23,7 +23,7 @@
   const UI_COLLAPSED_KEY = "x_bot_reply_filter_ui_collapsed_v1";
   const WHITELIST_KEY = "x_bot_reply_filter_whitelist_v1";
   const HIDDEN_ATTR = "data-x-bot-reply-filter-hidden";
-  const TWEET_SELECTOR = 'article[data-testid="tweet"]';
+  const TWEET_SELECTOR = 'article[data-testid="tweet"], div[data-testid="tweet"]';
 
   const config = {
     enabled: true,
@@ -128,6 +128,11 @@
     /空投|带单|跟单|稳赚|返利|量化|合约|币圈|打新/i,
   ];
 
+  const hardNamePatterns = [
+    /固\s*炮/i,
+    /固炮/i,
+  ];
+
   const invisibleRe = /[\u200B-\u200F\u2028-\u202F\u2060-\u206F\uFEFF\u00AD\u034F\u061C\u180E]/g;
 
   function deconfuse(text) {
@@ -180,6 +185,16 @@
     const node = article.querySelector('[data-testid="User-Name"]');
     if (!node) return "";
     return (node.textContent || "").split("@")[0].trim();
+  }
+
+  function getAuthorIdentityText(article) {
+    const node = article.querySelector('[data-testid="User-Name"]');
+    if (!node) return "";
+    const text = node.innerText || node.textContent || "";
+    const labels = [...node.querySelectorAll("[aria-label]")]
+      .map((item) => item.getAttribute("aria-label") || "")
+      .join(" ");
+    return `${text}\n${labels}`.trim();
   }
 
   function getAuthorHandle(article) {
@@ -403,18 +418,28 @@
     const normalized = normalizeText(rawText);
     const compact = compactText(rawText);
     const name = getAuthorName(article);
+    const identity = getAuthorIdentityText(article);
     const handle = getAuthorHandle(article);
     const reasons = [];
     const ruleHits = [];
     let score = 0;
 
-    if (!rawText.trim() || isWhitelisted(handle) || (config.skipVerified && isVerified(article))) {
+    if ((!rawText.trim() && !identity.trim()) || isWhitelisted(handle)) {
       return { score: 0, reasons, ruleHits, rawText, normalized, name, handle };
     }
 
     const customRules = loadRules();
     const contentText = `${rawText}\n${normalized}\n${compact}`;
-    const nameText = `${name}\n${normalizeText(name)}\n${compactText(name)}`;
+    const nameText = `${identity}\n${name}\n${handle}\n${normalizeText(identity)}\n${compactText(identity)}`;
+
+    const hardNameHit = hardNamePatterns.some((pattern) => pattern.test(nameText));
+    if (hardNameHit) {
+      score += config.threshold;
+      ruleHits.push("hard-name:固炮");
+      pushReason(reasons, "hard name keyword", config.threshold);
+    }
+
+    const verifiedProtected = config.skipVerified && isVerified(article);
 
     for (const keyword of normalizeRuleList(customRules.contentKeywords)) {
       const re = new RegExp(escapeRegExp(keyword), "i");
@@ -432,6 +457,10 @@
         ruleHits.push(`name:${keyword}`);
         pushReason(reasons, "custom name keyword", 8);
       }
+    }
+
+    if (verifiedProtected && !hardNameHit && score < config.threshold) {
+      return { score: 0, reasons: ["verified protected"], ruleHits, rawText, normalized, name, handle };
     }
 
     for (const rawRule of normalizeRuleList(customRules.regexKeywords)) {
