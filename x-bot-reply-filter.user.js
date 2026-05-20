@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         垃圾推号大扫除 - 自用版
 // @namespace    http://tampermonkey.net/
-// @version      6.17.3
+// @version      6.17.4
 // @description  扫描推文回复中的垃圾用户批量拉黑
 // @author       summeriscoming
 // @license MIT
@@ -541,6 +541,7 @@
   const EXPERIMENT_BROWSE_BLOCK_HEARTBEAT_STALE = 5 * 60 * 1000;
   const EXPERIMENT_BROWSE_BLOCK_MAX_AGE = 24 * 60 * 60 * 1000;
   const GLOBAL_BLOCK_QUEUE_KEY = 'global_block_queue_v1';
+  const GLOBAL_BLOCK_HISTORY_KEY = 'global_block_history_v1';
   const GLOBAL_BLOCK_QUEUE_LOCK_KEY = 'global_block_queue_worker_lock_v1';
   const GLOBAL_BLOCK_QUEUE_PAUSED_KEY = 'global_block_queue_paused_v1';
   const GLOBAL_BLOCK_QUEUE_PAUSE_REASON_KEY = 'global_block_queue_pause_reason_v1';
@@ -550,6 +551,7 @@
   const GLOBAL_BLOCK_QUEUE_ROUND_KEY = 'global_block_queue_round_v1';
   const GLOBAL_BLOCK_QUEUE_LOCK_TTL = 15000;
   const GLOBAL_BLOCK_QUEUE_DONE_MAX = 300;
+  const GLOBAL_BLOCK_HISTORY_MAX = 5000;
   const GLOBAL_BLOCK_QUEUE_SHORT_COOLDOWN_EVERY = 20;
   const GLOBAL_BLOCK_QUEUE_SHORT_COOLDOWN = 30000;
   const GLOBAL_BLOCK_QUEUE_SHORT_COOLDOWN_JITTER = 15000;
@@ -2609,6 +2611,46 @@
     GM_setValue(GLOBAL_BLOCK_QUEUE_KEY, { version: 1, updatedAt: Date.now(), items });
   }
 
+  function readGlobalBlockHistory() {
+    const raw = GM_getValue(GLOBAL_BLOCK_HISTORY_KEY, null);
+    const items = raw?.items && typeof raw.items === 'object' && !Array.isArray(raw.items) ? raw.items : {};
+    return { version: 1, updatedAt: Number(raw?.updatedAt || 0) || Date.now(), items };
+  }
+
+  function writeGlobalBlockHistory(history) {
+    const items = history.items && typeof history.items === 'object' ? history.items : {};
+    const ordered = Object.values(items)
+      .filter(item => item && normalizeHandle(item.handle))
+      .sort((a, b) => Number(b.blockedAt || b.updatedAt || 0) - Number(a.blockedAt || a.updatedAt || 0));
+    const keep = new Set(ordered.slice(0, GLOBAL_BLOCK_HISTORY_MAX).map(item => normalizeHandle(item.handle)));
+    Object.keys(items).forEach(key => {
+      if (!keep.has(normalizeHandle(key))) delete items[key];
+    });
+    GM_setValue(GLOBAL_BLOCK_HISTORY_KEY, { version: 1, updatedAt: Date.now(), items });
+  }
+
+  function archiveGlobalBlockedItem(item) {
+    const key = normalizeHandle(item?.handle);
+    if (!key) return;
+    const history = readGlobalBlockHistory();
+    history.items[key] = {
+      ...history.items[key],
+      ...item,
+      handle: key,
+      status: 'done',
+      blockedAt: Number(item.blockedAt || item.updatedAt || Date.now()),
+      archivedAt: Date.now(),
+      updatedAt: Number(item.updatedAt || Date.now()),
+    };
+    writeGlobalBlockHistory(history);
+  }
+
+  function globalBlockHistoryItems() {
+    return Object.values(readGlobalBlockHistory().items || {})
+      .filter(item => item && normalizeHandle(item.handle))
+      .sort((a, b) => Number(b.blockedAt || b.updatedAt || 0) - Number(a.blockedAt || a.updatedAt || 0));
+  }
+
   function globalBlockQueueItems(q = readGlobalBlockQueue()) {
     return Object.values(q.items || {}).filter(item => item && normalizeHandle(item.handle));
   }
@@ -2687,7 +2729,26 @@
           queueStatusDetail: detail || `加入时间 ${new Date(Number(item.addedAt || Date.now())).toLocaleTimeString()}`,
           queueUpdatedAt: Number(item.updatedAt || 0),
         };
-      });
+      })
+      .concat(showDone ? globalBlockHistoryItems()
+        .filter(item => !q.items?.[normalizeHandle(item.handle)])
+        .map(item => ({
+          handle: normalizeHandle(item.handle),
+          displayName: item.displayName || item.handle,
+          cats: new Set(normalizeQueuePreviewCats(item.previewCats)),
+          queueRowCat: 'liker',
+          heartHits: Array.isArray(item.heartHits) ? item.heartHits.map(v => String(v || '')).filter(Boolean).slice(0, 6) : [],
+          nameKwHits: Array.isArray(item.nameKwHits) ? item.nameKwHits.map(v => String(v || '')).filter(Boolean).slice(0, 6) : [],
+          kwHits: normalizeQueueKeywordHits(item.kwHits),
+          reHits: normalizeQueueRegexHits(item.reHits),
+          hideOnlyReHits: normalizeQueueRegexHits(item.hideOnlyReHits),
+          tweetSnippet: String(item.tweetSnippet || item.reason || ''),
+          queueStatus: 'done',
+          queueStatusLabel: '历史已屏蔽',
+          queueStatusDetail: `屏蔽时间 ${new Date(Number(item.blockedAt || item.updatedAt || Date.now())).toLocaleString()}`,
+          queueUpdatedAt: Number(item.blockedAt || item.updatedAt || 0),
+        }))
+        : []);
   }
 
   function showGlobalBlockQueueDetailPanel(forceOpen = true, q = null) {
@@ -3024,7 +3085,8 @@
             slow: experimentalBrowseBlockActive() || next.source === 'browse_auto',
           });
           const fresh = readGlobalBlockQueue();
-          fresh.items[key] = { ...fresh.items[key], status: 'done', updatedAt: Date.now(), error: '' };
+          fresh.items[key] = { ...fresh.items[key], status: 'done', updatedAt: Date.now(), blockedAt: Date.now(), error: '' };
+          archiveGlobalBlockedItem(fresh.items[key]);
           writeGlobalBlockQueue(fresh);
           incrementPersistentBlockedCount(1);
           markHandleBlockedFromQueue(next.handle);
@@ -4234,7 +4296,7 @@
       const refreshBtn = mkBtn('刷新', false);
       refreshBtn.onclick = showGlobalBlockQueueDetailPanel;
       const doneToggleBtn = mkBtn(globalQueueShowDone() ? '折叠已屏蔽' : '已屏蔽', false);
-      doneToggleBtn.title = globalQueueShowDone() ? '隐藏已完成和已跳过账号' : '展开查看已完成和已跳过账号';
+      doneToggleBtn.title = globalQueueShowDone() ? '隐藏已完成、已跳过和历史已屏蔽账号' : '展开查看已完成、已跳过和长期保存的历史已屏蔽账号';
       doneToggleBtn.onclick = () => setGlobalQueueShowDone(!globalQueueShowDone());
       const pauseBtn = mkBtn(globalBlockQueuePaused() ? '继续' : '暂停', false);
       pauseBtn.onclick = () => {
@@ -5144,8 +5206,7 @@
     p.style.cssText = [
       'position:fixed', `top:${pos.top}px`, `left:${pos.left}px`,
       `width:${size.width}px`, `height:${size.height}px`, 'box-sizing:border-box', 'padding:7px 8px',
-      'background:rgba(247,249,249,0.78)', `color:${C.text}`,
-      'backdrop-filter:blur(10px) saturate(135%)', '-webkit-backdrop-filter:blur(10px) saturate(135%)',
+      'background:#f7f9f9', `color:${C.text}`,
       'border:1px solid rgba(207,217,222,0.82)', 'border-radius:8px',
       'box-shadow:0 6px 22px rgba(15,20,25,0.10)',
       'font-size:11px', 'line-height:1.35',
@@ -5252,9 +5313,10 @@
     if (globalQueuePanelDragging) return;
     const minimized = globalBlockQueueMinimized();
     if (!minimized) {
-      document.getElementById('xfs-global-block-queue')?.remove();
       const panel = document.getElementById('xfs-panel');
-      if (panel?.dataset.xfsGlobalQueueView !== '1') setTimeout(() => showGlobalBlockQueueDetailPanel(false), 0);
+      if (panel?.dataset.xfsGlobalQueueView === '1') return;
+      GM_setValue(GLOBAL_BLOCK_QUEUE_MINIMIZED_KEY, true);
+      setTimeout(updateGlobalBlockQueuePanel, 0);
       return;
     }
     const detailPanel = document.getElementById('xfs-panel');
