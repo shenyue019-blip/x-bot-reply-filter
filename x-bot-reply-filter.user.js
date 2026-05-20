@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         垃圾推号大扫除 - 自用版
 // @namespace    http://tampermonkey.net/
-// @version      6.17.8
+// @version      6.17.9
 // @description  扫描推文回复中的垃圾用户批量拉黑
 // @author       summeriscoming
 // @license MIT
@@ -7137,7 +7137,8 @@
       referralHintRefreshDone.clear();
       removeBtn();
       removeListBtn();
-      document.getElementById('xfs-panel')?.remove();
+      const currentPanel = document.getElementById('xfs-panel');
+      if (!(currentPanel?.dataset.xfsGlobalQueueView === '1')) currentPanel?.remove();
       setTimeout(captureReferralAccountsFromProfileDom, 300);
       setTimeout(ensureRouteButtons, 300);
       startButtonWatchdog(12000, 500);
