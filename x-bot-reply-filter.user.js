@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         垃圾推号大扫除 - 自用版
 // @namespace    http://tampermonkey.net/
-// @version      6.18.12
+// @version      6.18.13
 // @description  扫描推文回复中的垃圾用户批量拉黑
 // @author       summeriscoming
 // @license MIT
@@ -28,6 +28,7 @@
   const HEART_RE   = /[\u2764\u2665\u2763\u{1F493}\u{1F494}\u{1F495}\u{1F496}\u{1F497}\u{1F498}\u{1F499}\u{1F49A}\u{1F49B}\u{1F49C}\u{1F49D}\u{1F49E}\u{1F49F}\u{1F5A4}\u{1F90D}\u{1F90E}\u{1F9E1}]/u;
   // Basic CJK block — used to distinguish Chinese-context tweets from English ones
   const CHINESE_RE = /[\u4e00-\u9fff\u3400-\u4dbf]/;
+  const FOREIGN_LANGUAGE_RE = /[\p{Script=Latin}\p{Script=Cyrillic}\p{Script=Greek}\p{Script=Arabic}\p{Script=Hebrew}\p{Script=Devanagari}\p{Script=Thai}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
   const FACE_EMOJI_SRC = '[\\u{1F600}-\\u{1F64F}]|[\\u{1F910}-\\u{1F917}]|[\\u{1F920}-\\u{1F92F}]|[\\u{1F970}-\\u{1F97A}]|\\u{1F9D0}|[\\u{1FAE0}-\\u{1FAE8}]|[\\u263A\\u2639]';
   const NON_FACE_EMOJI_SRC = `(?!(?:${FACE_EMOJI_SRC}))\\p{Extended_Pictographic}[\\uFE0F\\u{1F3FB}-\\u{1F3FF}]?`;
   // Strange characters for decorative spam: Unicode symbols only. Punctuation, including CJK/fullwidth punctuation, is intentionally excluded.
@@ -549,6 +550,7 @@
   const GLOBAL_BLOCK_QUEUE_MINIMIZED_KEY = 'global_block_queue_minimized_v1';
   const GLOBAL_BLOCK_QUEUE_POS_KEY = 'global_block_queue_position_v1';
   const GLOBAL_BLOCK_QUEUE_SHOW_DONE_KEY = 'global_block_queue_show_done_v1';
+  const GLOBAL_BLOCK_QUEUE_DETAIL_TAB_KEY = 'global_block_queue_detail_tab_v1';
   const GLOBAL_BLOCK_QUEUE_ROUND_KEY = 'global_block_queue_round_v1';
   const GLOBAL_BLOCK_QUEUE_LOCK_TTL = 15000;
   const GLOBAL_BLOCK_QUEUE_DONE_MAX = 300;
@@ -593,7 +595,7 @@
   const AI_WORK_LOG_KEY = 'xfs-ai-work-log-v1';
   const AI_WORK_LOG_MAX = 5000;
   const AI_AUTO_RULES_KEY = 'xfs-ai-auto-rules-v1';
-  const AI_REVIEW_DEFAULT_MODEL = 'gpt-5.5';
+  const AI_REVIEW_DEFAULT_MODEL = 'gpt-5-nano';
   const DAY_MS = 24 * 60 * 60 * 1000;
   const EXPERIMENT_TIMING_DEFAULTS = Object.freeze({
     slowBlockingMode: false,
@@ -643,8 +645,8 @@
   let globalQueuePanelDragging = false;
   let globalQueuePanelSuppressed = false;
   let refreshAiReviewControlsFn = null;
-  let refreshAiLearningControlsFn = null;
   let refreshAiWorkLogPanelFn = null;
+  let refreshAiLearningPanelFn = null;
   let experimentalBrowseBlockHeartbeatTimer = null;
   const matchedHandlesInView = new Set(); // accumulates matched handles this scroll session; reset on nav
   const matchedUsersCache = new Map();   // handle → full user object; survives DOM unload by React virtual list
@@ -1201,6 +1203,41 @@
     if (aiHiddenHandles.delete(key)) saveAiHiddenHandles();
   }
 
+  function clearXfsHiddenArticle(art) {
+    if (!art) return;
+    art.dataset.xfsHidden = '';
+    ['max-height','min-height','overflow','padding','margin-top','margin-bottom','pointer-events','border-bottom']
+      .forEach(p => art.style.removeProperty(p));
+  }
+
+  function clearVisibleStateForAiExemptHandle(handle) {
+    const key = normalizeHandle(handle);
+    if (!key) return;
+    matchedHandlesInView.delete(key);
+    matchedUsersCache.delete(key);
+    document.querySelectorAll('article[data-testid="tweet"]').forEach(art => {
+      const artHandle = normalizeHandle(art.dataset.xfsReferralHandle || extractHandleFromArticle(art));
+      if (artHandle !== key) return;
+      delete art.dataset.xfsHideMatched;
+      delete art.dataset.xfsAiHidden;
+      delete art.dataset.xfsReferralAccount;
+      clearXfsHiddenArticle(art);
+      clearBlockedArticleStyle(art);
+      const btn = art.querySelector(`button[data-xfs-handle]`);
+      if (btn) {
+        btn.dataset.xfsMatched = '0';
+        btn.dataset.xfsHideOnlyMatched = '0';
+        btn.dataset.xfsReferralAccount = '0';
+        delete btn.dataset.xfsMatchTooltip;
+        delete btn.dataset.xfsHideOnlyTooltip;
+        delete btn.dataset.xfsReferralTooltip;
+        updateInlineBlockButton(btn);
+      }
+    });
+    updateHideBadge();
+    applyHideAll();
+  }
+
   function clearQueuedAiReviewForHandle(handle) {
     const key = normalizeHandle(handle);
     if (!key) return;
@@ -1345,15 +1382,35 @@
   function aiWorkLogActionLabel(item) {
     if (item.kind === 'error') return '错误';
     if (item.kind === 'key_check') return 'API key';
-    if (item.kind === 'test') return '试跑';
-    return item.action === 'block' ? '拉黑' : (item.action === 'hide' ? '隐藏' : '放行');
+    if (item.kind === 'test') return '测试';
+    return item.action === 'block' ? '拉黑' : '放行';
   }
 
   function aiWorkLogActionHint(item) {
     if (item.kind === 'error') return 'AI 失败';
     if (item.kind === 'key_check') return 'key 检测';
-    if (item.kind === 'test') return 'AI 试跑';
-    return item.action === 'block' ? 'AI 判断：拉黑' : (item.action === 'hide' ? 'AI 判断：隐藏' : 'AI 判断：放行');
+    if (item.kind === 'test') return 'AI 测试';
+    return item.action === 'block' ? 'AI 判断：拉黑' : 'AI 判断：放行';
+  }
+
+  function sourceLabel(source) {
+    const key = String(source || '').trim();
+    const map = {
+      ai_review: 'AI 判断',
+      ai_correction: '人工纠正',
+      manual_test: '手动测试',
+      manual_unblock: '取消拉黑',
+      manual: '手动操作',
+      inline: '手动点击',
+      panel: '手动勾选',
+      auto: '自动扫描',
+      browse: '边刷边拉黑',
+      referral: '导流扫描',
+      list: '列表扫描',
+      sweep: '整页扫描',
+      key_check: 'API key 检测',
+    };
+    return map[key] || key || '-';
   }
 
   function applyAiWorkLogCorrection(item, nextLabel) {
@@ -1363,7 +1420,7 @@
       handle,
       displayName: String(item?.displayName || handle),
       source: 'ai_correction',
-      reason: `ai_${String(item?.action || 'ignore')}=>${nextLabel}`,
+      reason: `人工纠正：${aiReviewActionLabel(item?.action)} -> ${aiReviewActionLabel(nextLabel)}`,
     };
     recordAiWorkLog({
       kind: 'correction',
@@ -1380,27 +1437,24 @@
     if (nextLabel === 'block') {
       forgetAiExemptHandle(handle);
       enqueueGlobalBlockUsers([{ ...base, source: 'manual' }], 'manual');
-      showToast(`已将 @${handle} 纠正为拉黑候选`, false);
-    } else if (nextLabel === 'hide') {
-      rememberAiHiddenHandle(base, { source: 'ai_correction', reason: base.reason, confidence: Number(item?.confidence || 0) });
-      applyHideAll();
-      showToast(`已将 @${handle} 纠正为隐藏`, false);
+      showToast(`已将 @${handle} 标记为拉黑，并加入排队`, false);
     } else {
       purgeAiMemoryForHandle(handle);
       rememberAiExemptHandle(base, { source: 'ai_correction', reason: base.reason });
       removeQueuedGlobalBlockForHandle(handle);
-      showToast(`已将 @${handle} 纠正为放行`, false);
+      clearVisibleStateForAiExemptHandle(handle);
+      showToast(`已将 @${handle} 标记为放行，之后不再隐藏或拉黑`, false);
     }
     if (typeof refreshAiWorkLogPanelFn === 'function') refreshAiWorkLogPanelFn();
-    if (typeof refreshAiLearningControlsFn === 'function') refreshAiLearningControlsFn();
+    if (typeof refreshAiLearningPanelFn === 'function') refreshAiLearningPanelFn();
     if (typeof refreshAiReviewControlsFn === 'function') refreshAiReviewControlsFn();
   }
 
   function renderAiWorkLogRows(listEl, statusEl) {
-    const recent = aiWorkLog.slice(0, 30);
+    const recent = aiWorkLog;
     if (statusEl) {
       statusEl.textContent = recent.length
-        ? `记录 ${aiWorkLog.length} 条 · 最新 ${recent[0].kind} / ${recent[0].action} @${recent[0].handle || '-'}${recent[0].reason ? ` · ${recent[0].reason}` : ''}`
+        ? `AI 判断记录 ${aiWorkLog.length} 条 · 最新：${aiWorkLogActionHint(recent[0])} @${recent[0].handle || '-'}${recent[0].reason ? ` · ${recent[0].reason}` : ''}`
         : '暂无 AI 工作记录';
       statusEl.title = statusEl.textContent;
     }
@@ -1421,17 +1475,17 @@
       row.title = [
         aiWorkLogActionHint(item),
         `AI 判断：${aiWorkLogActionLabel(item)}`,
-        item.displayName ? `昵称: ${item.displayName}` : '',
+        item.displayName ? `昵称：${item.displayName}` : '',
         item.handle ? `@${item.handle}` : '',
-        item.source ? `来源: ${item.source}` : '',
-        item.reason ? `原因: ${item.reason}` : '',
-        item.ruleSuggestion ? `建议: ${item.ruleSuggestion.scope} = ${item.ruleSuggestion.value}` : '',
+        item.source ? `来源：${sourceLabel(item.source)}` : '',
+        item.reason ? `原因：${item.reason}` : '',
+        item.ruleSuggestion ? `建议规则：${item.ruleSuggestion.scope} = ${item.ruleSuggestion.value}` : '',
       ].filter(Boolean).join('\n');
       row.onmouseenter = () => { row.style.background = C.rowHover; };
       row.onmouseleave = () => { row.style.background = '#fff'; };
 
       const status = document.createElement('span');
-      status.textContent = item.kind === 'error' ? '!' : (item.kind === 'key_check' ? '✓' : (item.action === 'block' ? '●' : (item.action === 'hide' ? '◐' : '•')));
+      status.textContent = item.kind === 'error' ? '!' : (item.kind === 'key_check' ? '✓' : (item.action === 'block' ? '●' : '•'));
       status.title = aiWorkLogActionHint(item);
       status.style.cssText = `width:13px;margin-top:1px;flex-shrink:0;text-align:center;font-size:12px;font-weight:800;color:${color};`;
       row.appendChild(status);
@@ -1441,11 +1495,11 @@
       const profileUrl = item.handle && !['api_key', ''].includes(item.handle) ? `https://x.com/${encodeURIComponent(item.handle)}` : '';
       const profileTitle = profileUrl ? `打开 @${item.handle} 主页` : '';
       let html = `<div class="xfs-name" style="font-size:11px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${profileUrl ? `<a class="xfs-profile-link" href="${profileUrl}" target="_blank" rel="noopener noreferrer" title="${esc(profileTitle)}" style="color:inherit;text-decoration:underline;text-decoration-thickness:1px;text-underline-offset:2px;">${esc(item.displayName || item.handle || item.kind)}</a>` : esc(item.displayName || item.handle || item.kind)}</div>`;
-      html += `<div style="color:${C.sub};font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(item.handle ? `@${item.handle}` : item.source || '')}</div>`;
+      html += `<div style="color:${C.sub};font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(item.handle ? `@${item.handle}` : sourceLabel(item.source))}</div>`;
       html += `<div style="font-size:9px;color:${color};font-weight:800;">AI 判断：${esc(aiWorkLogActionLabel(item))}${item.confidence ? ` · ${Math.round(item.confidence * 100)}%` : ''}</div>`;
       if (item.reason) html += `<div style="font-size:9px;color:${C.sub};word-break:break-all;">${esc(item.reason)}</div>`;
       if (item.ruleSuggestion?.scope && item.ruleSuggestion?.value) {
-        html += `<div style="font-size:9px;color:${C.regexKw};word-break:break-all;">建议规则: ${esc(item.ruleSuggestion.scope)} = ${esc(item.ruleSuggestion.value)}</div>`;
+        html += `<div style="font-size:9px;color:${C.regexKw};word-break:break-all;">建议规则：${esc(item.ruleSuggestion.scope)} = ${esc(item.ruleSuggestion.value)}</div>`;
       }
       info.innerHTML = html;
       row.appendChild(info);
@@ -1453,16 +1507,18 @@
       const actions = document.createElement('div');
       actions.style.cssText = 'position:absolute;top:4px;right:5px;display:flex;gap:4px;align-items:center;';
       const actionDefs = [
-        { label: '判错，改拉黑', value: 'block', color: C.blockRed },
-        { label: '判错，改隐藏', value: 'hide', color: C.mute },
-        { label: '判错，改放行', value: 'ignore', color: C.sub },
+        { label: '拉黑', value: 'block', color: C.blockRed },
+        { label: '放行', value: 'ignore', color: C.sub },
       ];
       actionDefs.forEach(def => {
         const b = document.createElement('button');
         b.type = 'button';
         b.textContent = def.label;
-        b.title = `把当前 AI 判断 ${aiWorkLogActionLabel(item)} 纠正为 ${def.label.replace('判错，改', '')}`;
-        b.style.cssText = `border:1px solid ${C.btnBorder};background:#fff;color:${def.color};border-radius:6px;padding:2px 6px;font-size:10px;font-weight:700;cursor:pointer;`;
+        const selected = def.value === 'block' ? item.action === 'block' : item.action !== 'block';
+        b.title = selected
+          ? `当前结果：${def.label}`
+          : `如果判断错了，改为${def.label}`;
+        b.style.cssText = `border:1px solid ${selected ? def.color : C.btnBorder};background:${selected ? `${def.color}12` : '#fff'};color:${def.color};border-radius:6px;padding:2px 8px;font-size:10px;font-weight:800;cursor:pointer;`;
         b.onclick = () => applyAiWorkLogCorrection(item, def.value);
         actions.appendChild(b);
       });
@@ -1472,56 +1528,40 @@
     });
   }
 
-  function showAiWorkLogPanel() {
-    const existing = document.getElementById('xfs-ai-work-log-panel');
-    if (existing) existing.remove();
-    const p = document.createElement('div');
-    p.id = 'xfs-ai-work-log-panel';
-    p.style.cssText = [
-      'position:fixed', `right:${toolbarRightPx(40)}`, `bottom:${toolbarBottomPx(166)}`,
-      'width:min(520px, calc(100vw - 24px))', 'height:min(72vh, 640px)', 'box-sizing:border-box', 'padding:8px',
-      'background:rgba(255,255,255,0.97)',
-      'backdrop-filter:blur(6px)', '-webkit-backdrop-filter:blur(6px)',
-      `border:1px solid ${C.mute}`,
-      'border-radius:8px',
-      'box-shadow:0 6px 22px rgba(15,20,25,0.14)',
-      `font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif`,
-      `color:${C.text}`, 'font-size:12px',
-      'display:flex', 'flex-direction:column', 'gap:6px',
-      'z-index:2147483647',
-    ].join(';');
-
-    const hdr = document.createElement('div');
-    hdr.style.cssText = `display:flex;align-items:center;gap:8px;padding:2px 2px 4px;border-bottom:1px solid ${C.border};`;
-    const title = document.createElement('div');
-    title.textContent = 'AI 工作记录';
-    title.style.cssText = `flex:1;font-size:12px;font-weight:800;color:${C.mute};`;
-    const refreshBtn = document.createElement('button');
-    refreshBtn.type = 'button';
-    refreshBtn.textContent = '刷新';
-    refreshBtn.style.cssText = `border:1px solid ${C.btnBorder};background:#fff;color:${C.sub};border-radius:7px;padding:3px 8px;font-size:11px;cursor:pointer;`;
-    const closeBtn = document.createElement('button');
-    closeBtn.type = 'button';
-    closeBtn.textContent = '关闭';
-    closeBtn.style.cssText = `border:1px solid ${C.btnBorder};background:#fff;color:${C.sub};border-radius:7px;padding:3px 8px;font-size:11px;cursor:pointer;`;
-    const status = document.createElement('div');
-    status.style.cssText = `font-size:10px;line-height:1.35;color:${C.sub};word-break:break-word;`;
-    const list = document.createElement('div');
-    list.style.cssText = 'flex:1;min-height:0;overflow:auto;padding-right:2px;display:flex;flex-direction:column;gap:4px;';
-    const refresh = () => {
-      renderAiWorkLogRows(list, status);
-    };
-    refreshBtn.onclick = refresh;
-    closeBtn.onclick = () => p.remove();
-    hdr.appendChild(title);
-    hdr.appendChild(refreshBtn);
-    hdr.appendChild(closeBtn);
-    p.appendChild(hdr);
-    p.appendChild(status);
-    p.appendChild(list);
-    document.body.appendChild(p);
-    refresh();
-    refreshAiWorkLogPanelFn = refresh;
+  function renderAiLearningRows(listEl, statusEl) {
+    const last = loadAiLearningLast();
+    const rawCount = Array.isArray(GM_getValue(AI_LEARNING_EXAMPLES_KEY, [])) ? GM_getValue(AI_LEARNING_EXAMPLES_KEY, []).length : 0;
+    if (statusEl) {
+      statusEl.textContent = last
+        ? `学习样本 ${aiLearningExamples.length} 条 / 原始 ${rawCount} 条 · 最近一次 ${aiReviewActionLabel(last.label)} @${last.handle || '-'}${last.source ? ` · ${sourceLabel(last.source)}` : ''}${last.reason ? ` · ${last.reason}` : ''}`
+        : `学习样本 ${aiLearningExamples.length} 条 / 原始 ${rawCount} 条 · 还没有写入过学习样本`;
+      statusEl.title = statusEl.textContent;
+    }
+    listEl.textContent = '';
+    if (!aiLearningExamples.length) {
+      const empty = document.createElement('div');
+      empty.textContent = '暂无学习样本';
+      empty.style.cssText = `font-size:10px;color:${C.sub};padding:8px 0;`;
+      listEl.appendChild(empty);
+      return;
+    }
+    aiLearningExamples.forEach(item => {
+      const color = item.label === 'block' ? C.blockRed : C.sub;
+      const row = document.createElement('div');
+      row.style.cssText = `border-left:3px solid ${color};border-bottom:1px solid ${C.border};padding:4px 6px;background:#fff;font-size:10px;line-height:1.35;word-break:break-word;`;
+      const profileUrl = item.handle ? `https://x.com/${encodeURIComponent(item.handle)}` : '';
+      const profileHtml = profileUrl
+        ? `<a href="${profileUrl}" target="_blank" rel="noopener noreferrer" style="color:inherit;text-decoration:underline;text-decoration-thickness:1px;text-underline-offset:2px;">@${esc(item.handle)}</a>`
+        : '@-';
+      row.innerHTML = [
+        `<div style="font-size:11px;font-weight:800;color:${color};">学习结果：${esc(aiReviewActionLabel(item.label))}</div>`,
+        `<div style="color:${C.text};font-weight:700;">${profileHtml}${item.displayName ? ` · ${esc(item.displayName)}` : ''}</div>`,
+        `<div style="color:${C.sub};">来源：${esc(sourceLabel(item.source))} · ${item.ts ? esc(new Date(Number(item.ts)).toLocaleString()) : '-'}</div>`,
+        item.reason ? `<div style="color:${C.sub};">${esc(item.reason)}</div>` : '',
+      ].filter(Boolean).join('');
+      row.querySelectorAll('a').forEach(a => a.addEventListener('click', e => e.stopPropagation()));
+      listEl.appendChild(row);
+    });
   }
 
   function recordAiLearningExample(user, label, meta = {}) {
@@ -1540,7 +1580,7 @@
     saveAiLearningExamples();
     saveAiLearningLast(entry);
     if (typeof refreshAiReviewControlsFn === 'function') refreshAiReviewControlsFn();
-    if (typeof refreshAiLearningControlsFn === 'function') refreshAiLearningControlsFn();
+    if (typeof refreshAiLearningPanelFn === 'function') refreshAiLearningPanelFn();
   }
 
   function aiLearningExampleText(limit = 6) {
@@ -1659,6 +1699,7 @@
 
   function isStrongNameIssueMatch(user) {
     if (!user) return false;
+    if (userHasForeignLanguage(user)) return false;
     const nameKwHits = Array.isArray(user.nameKwHits) ? user.nameKwHits.length : 0;
     const nameRegexHits = Array.isArray(user.reHits)
       ? user.reHits.filter(hit => String(hit?.snippet || '').startsWith('昵称:')).length
@@ -1668,7 +1709,6 @@
 
   function aiReviewActionLabel(action) {
     if (action === 'block') return '拉黑';
-    if (action === 'hide') return '隐藏';
     return '放行';
   }
 
@@ -1692,14 +1732,13 @@
 
   async function requestAiReviewDecision(user, opts = {}) {
     const key = normalizeHandle(user?.handle || '');
-    if (!key) throw new Error('missing handle');
+    if (!key) throw new Error('缺少账号 handle');
     const cached = aiReviewCacheLookup(user);
     if (cached) return { ...cached, cached: true };
 
     const body = {
       model: aiReviewModel(),
-      temperature: 0,
-      max_tokens: 160,
+      max_completion_tokens: 220,
       response_format: {
         type: 'json_schema',
         json_schema: {
@@ -1708,22 +1747,27 @@
             type: 'object',
             additionalProperties: false,
             properties: {
-              action: { type: 'string', enum: ['block', 'hide', 'ignore'] },
+              action: { type: 'string', enum: ['block', 'ignore'] },
               confidence: { type: 'number', minimum: 0, maximum: 1 },
               reason: { type: 'string' },
               rule_suggestion: {
-                type: 'object',
-                additionalProperties: false,
-                properties: {
-                  scope: { type: 'string', enum: ['name_keyword', 'content_keyword', 'name_regex', 'content_regex', 'hide_only_regex'] },
-                  value: { type: 'string' },
-                  note: { type: 'string' },
-                  confidence: { type: 'number', minimum: 0, maximum: 1 },
-                },
-                required: ['scope', 'value', 'note', 'confidence'],
+                anyOf: [
+                  {
+                    type: 'object',
+                    additionalProperties: false,
+                    properties: {
+                      scope: { type: 'string', enum: ['name_keyword', 'content_keyword', 'name_regex', 'content_regex', 'hide_only_regex'] },
+                      value: { type: 'string' },
+                      note: { type: 'string' },
+                      confidence: { type: 'number', minimum: 0, maximum: 1 },
+                    },
+                    required: ['scope', 'value', 'note', 'confidence'],
+                  },
+                  { type: 'null' },
+                ],
               },
             },
-            required: ['action', 'confidence', 'reason'],
+            required: ['action', 'confidence', 'reason', 'rule_suggestion'],
           },
           strict: true,
         },
@@ -1731,7 +1775,7 @@
       messages: [
         {
           role: 'system',
-          content: '你是中文 X/Twitter 回复垃圾账号审查器。只根据用户提供的信息分类，不要推测额外事实。输出 block、hide、ignore 三选一。用户名、昵称、主页式营销、联系方式、明显引流，优先 block；正文可疑但账号不够确定，优先 hide；看起来正常或不确定，ignore。若能提炼出稳定、可复用的规则，补充一个 rule_suggestion。只输出 JSON。',
+          content: '你是中文 X/Twitter 回复垃圾账号审查器。只根据用户提供的信息分类，不要推测额外事实。只输出 block 或 ignore：block 表示建议加入拉黑排队，ignore 表示放行且之后不再隐藏或拉黑。脚本会先用本地规则隐藏可疑回复，你只判断是否应该拉黑。用户名、昵称、主页式营销、联系方式、明显引流，优先 block；看起来正常、不确定、或只是外语但没有垃圾/引流证据，ignore。若能提炼出稳定、可复用的规则，补充 rule_suggestion；没有建议时 rule_suggestion 为 null。只输出 JSON。',
         },
         {
           role: 'user',
@@ -1742,7 +1786,7 @@
       safety_identifier: stableStringHash(key),
     };
     const apiKey = aiReviewApiKey();
-    if (!apiKey) throw new Error('missing OpenAI API key');
+    if (!apiKey) throw new Error('未配置 OpenAI API key');
     return new Promise((resolve, reject) => {
       GM_xmlhttpRequest({
         method: 'POST',
@@ -1762,7 +1806,7 @@
             const content = String(data?.choices?.[0]?.message?.content || '').trim();
             const jsonText = content.match(/\{[\s\S]*\}/)?.[0] || content;
             const parsed = JSON.parse(jsonText);
-            const action = ['block', 'hide', 'ignore'].includes(parsed?.action) ? parsed.action : 'ignore';
+            const action = ['block', 'ignore'].includes(parsed?.action) ? parsed.action : 'ignore';
             const confidence = Math.max(0, Math.min(1, Number(parsed?.confidence) || 0));
             const reason = String(parsed?.reason || '').trim().slice(0, 300) || 'AI 未返回理由';
             const ruleSuggestion = parsed?.rule_suggestion && typeof parsed.rule_suggestion === 'object' ? {
@@ -1783,7 +1827,7 @@
           }
         },
         onerror() {
-          reject(new Error('Network error'));
+          reject(new Error('网络请求失败'));
         },
       });
     });
@@ -1830,29 +1874,21 @@
               ...item,
               handle,
               source: 'ai_review',
-              reason: `AI复核：${decision.reason}`,
+              reason: `AI 判断：${decision.reason}`,
               aiDecision: 'block',
               aiReason: decision.reason,
               aiConfidence: decision.confidence,
             }], 'ai_review');
-            showToast(`AI复核：@${handle} 已加入拉黑排队`, false);
-          } else if (decision.action === 'hide') {
-            rememberAiHiddenHandle(item, {
+            showToast(`AI 判断：@${handle} 已加入拉黑排队`, false);
+          } else {
+            purgeAiMemoryForHandle(handle);
+            rememberAiExemptHandle(item, {
               reason: decision.reason,
-              confidence: decision.confidence,
               source: item.source || 'ai_review',
             });
-            matchedHandlesInView.delete(handle);
-            matchedUsersCache.delete(handle);
-            matchedUsersCache.delete(normalizeHandle(handle));
-            updateHideBadge();
-            document.querySelectorAll(`article[data-testid="tweet"]`).forEach(art => {
-              const artHandle = normalizeHandle(art.dataset.xfsReferralHandle || extractHandleFromArticle(art));
-              if (artHandle !== handle) return;
-              art.dataset.xfsAiHidden = '1';
-            });
-            applyHideAll();
-            showToast(`AI复核：@${handle} 已隐藏`, false);
+            removeQueuedGlobalBlockForHandle(handle);
+            clearVisibleStateForAiExemptHandle(handle);
+            showToast(`AI 判断：@${handle} 已放行，之后不再隐藏或拉黑`, false);
           }
         } catch (e) {
           recordAiWorkLog({
@@ -1862,7 +1898,7 @@
             handle,
             displayName: item.displayName,
             source: item.source,
-            reason: e?.message || String(e || 'AI review failed'),
+            reason: e?.message || String(e || 'AI 判断失败'),
             confidence: 0,
             fingerprint: `${aiReviewFingerprint(item)}:error:${String(e?.message || e || 'failed')}`,
           });
@@ -2380,7 +2416,7 @@
             reject(e);
           }
         },
-        onerror() { reject(makeReferralError('Network error')); },
+        onerror() { reject(makeReferralError('网络请求失败')); },
       });
     });
   }
@@ -2645,6 +2681,23 @@
     return (String(s).match(/[a-z]/gi) || []).length;
   }
 
+  function hasForeignLanguageText(text) {
+    return FOREIGN_LANGUAGE_RE.test(stripInvisible(String(text || '')));
+  }
+
+  function userHasForeignLanguage(user) {
+    if (!user) return false;
+    const text = [
+      user.displayName,
+      user.tweetSnippet,
+      user.reason,
+      ...(Array.isArray(user.kwHits) ? user.kwHits.map(hit => `${hit?.kw || ''} ${hit?.snippet || ''}`) : []),
+      ...(Array.isArray(user.reHits) ? user.reHits.map(hit => `${hit?.pat || ''} ${hit?.snippet || ''}`) : []),
+      ...(Array.isArray(user.hideOnlyReHits) ? user.hideOnlyReHits.map(hit => `${hit?.pat || ''} ${hit?.snippet || ''}`) : []),
+    ].filter(Boolean).join('\n');
+    return hasForeignLanguageText(text);
+  }
+
   function getContextSnippets(text, keywords, len) {
     const hits = [];
     // Normalize: remove invisible format characters before matching so that
@@ -2709,6 +2762,7 @@
     const reHits     = [...nameReHits, ...bodyReHits];
     const allHideOnlyReHits = getRegexHits(fullText, HIDE_ONLY_RE_KWS, 'body').map(h => ({ ...h, type: 'hide_only_regex' }));
     const hideOnlyReHits = hideOnlyRulesActive ? allHideOnlyReHits : [];
+    const foreignHit = hasForeignLanguageText(displayName) || hasForeignLanguageText(fullText);
     const cats = new Set();
     const directCats = new Set();
     const reviewCats = new Set();
@@ -2717,14 +2771,17 @@
     if (kwHits.length     > 0) cats.add('suspect');
     if (reHits.length     > 0) cats.add('regex_kw');
     if (hideOnlyReHits.length > 0) cats.add('hide_only_regex');
-    if (nameKwHits.length > 0) directCats.add('name_kw');
-    if (nameReHits.length > 0) directCats.add('regex_kw');
+    if (foreignHit) cats.add('foreign');
+    if (nameKwHits.length > 0 && !foreignHit) directCats.add('name_kw');
+    if (nameReHits.length > 0 && !foreignHit) directCats.add('regex_kw');
     if (heartHits.length  > 0) reviewCats.add('heart');
     if (kwHits.length     > 0) reviewCats.add('suspect');
     if (reHits.length     > 0) reviewCats.add('regex_kw');
+    if (foreignHit) reviewCats.add('foreign');
+    const localRuleMatched = heartHits.length > 0 || nameKwHits.length > 0 || kwHits.length > 0 || reHits.length > 0;
     return {
       matched: cats.size > 0,
-      actionableMatched: directCats.size > 0,
+      actionableMatched: localRuleMatched,
       hideOnlyMatched: hideOnlyReHits.length > 0,
       cats,
       actionableCats: directCats,
@@ -2751,7 +2808,7 @@
   }
 
   function normalizeQueuePreviewCats(cats) {
-    const allowed = new Set(['heart', 'name_kw', 'suspect', 'regex_kw', 'hide_only_regex', 'referral', 'liker']);
+    const allowed = new Set(['heart', 'name_kw', 'suspect', 'regex_kw', 'hide_only_regex', 'foreign', 'referral', 'liker']);
     const list = Array.isArray(cats) ? cats : Array.from(cats || []);
     return list.map(v => String(v || '')).filter(v => allowed.has(v)).slice(0, 6);
   }
@@ -3249,6 +3306,24 @@
     return remaining > 0 ? `本轮 ${round.count} · 冷却 ${formatGlobalQueueCooldown(remaining)}` : `本轮 ${round.count}`;
   }
 
+  function globalQueueStatusText(q = readGlobalBlockQueue()) {
+    const counts = globalBlockQueueSummary(q).counts;
+    const paused = globalBlockQueuePaused();
+    const pauseReason = globalBlockQueuePauseReason();
+    const round = readGlobalQueueRound();
+    const cooldownRemaining = Number(round.cooldownUntil || 0) - Date.now();
+    if (paused) {
+      const reasonText = pauseReason === 'auth' ? '登录失效' : (pauseReason === 'rate_limit' ? '平台限流' : '手动暂停');
+      return `状态：暂停中 · ${reasonText} · 队列 ${counts.queued} · 失败 ${counts.failed}`;
+    }
+    if (cooldownRemaining > 0) {
+      return `状态：冷却中 · 剩余 ${formatGlobalQueueCooldown(cooldownRemaining)} · ${round.reason || '队列冷却'} · 队列 ${counts.queued}`;
+    }
+    if (counts.running) return `状态：执行中 · 正在拉黑 ${counts.running} · 队列 ${counts.queued}`;
+    if (counts.queued) return `状态：等待执行 · 队列 ${counts.queued}`;
+    return `状态：空闲 · 完成 ${counts.done} · 失败 ${counts.failed}`;
+  }
+
   async function coolDownGlobalBlockQueue(until, reason) {
     const round = readGlobalQueueRound();
     const cooldownUntil = Math.max(Date.now(), Number(until || 0));
@@ -3301,7 +3376,7 @@
         },
         onerror(e) {
           console.error(`[XFS] ERROR @${handle}:`, e);
-          reject(new Error('Network error'));
+          reject(new Error('网络请求失败'));
         },
       });
     });
@@ -3595,9 +3670,9 @@
         const status = item.status || 'queued';
         const label = GLOBAL_QUEUE_STATUS_LABELS[status] || status;
         const detail = [
-          item.source ? `来源 ${item.source}` : '',
-          item.aiDecision ? `AI ${item.aiDecision}${item.aiConfidence ? ` ${Math.round(Number(item.aiConfidence) * 100)}%` : ''}` : '',
-          item.aiReason ? `AI理由 ${item.aiReason}` : '',
+          item.source ? `来源 ${sourceLabel(item.source)}` : '',
+          item.aiDecision ? `AI 判断 ${aiReviewActionLabel(item.aiDecision)}${item.aiConfidence ? ` ${Math.round(Number(item.aiConfidence) * 100)}%` : ''}` : '',
+          item.aiReason ? `AI 理由 ${item.aiReason}` : '',
           item.attempts ? `尝试 ${item.attempts}` : '',
           item.error ? `错误 ${item.error}` : '',
         ].filter(Boolean).join(' · ');
@@ -3610,7 +3685,7 @@
           hideOnlyReHits: normalizeQueueRegexHits(item.hideOnlyReHits),
         });
         const aiSummary = item.aiDecision
-          ? `AI ${item.aiDecision}${item.aiConfidence ? ` ${Math.round(Number(item.aiConfidence) * 100)}%` : ''}${item.aiReason ? ` · ${item.aiReason}` : ''}`
+          ? `AI 判断：${aiReviewActionLabel(item.aiDecision)}${item.aiConfidence ? ` ${Math.round(Number(item.aiConfidence) * 100)}%` : ''}${item.aiReason ? ` · ${item.aiReason}` : ''}`
           : 'AI 未参与';
         const previewCats = normalizeQueuePreviewCats(item.previewCats);
         return {
@@ -3657,7 +3732,7 @@
             hideOnlyReHits: normalizeQueueRegexHits(item.hideOnlyReHits),
           }),
           queueAiSummary: item.aiDecision
-            ? `AI ${item.aiDecision}${item.aiConfidence ? ` ${Math.round(Number(item.aiConfidence) * 100)}%` : ''}${item.aiReason ? ` · ${item.aiReason}` : ''}`
+            ? `AI 判断：${aiReviewActionLabel(item.aiDecision)}${item.aiConfidence ? ` ${Math.round(Number(item.aiConfidence) * 100)}%` : ''}${item.aiReason ? ` · ${item.aiReason}` : ''}`
             : 'AI 未参与',
           queueUpdatedAt: Number(item.blockedAt || item.updatedAt || 0),
         }))
@@ -3779,6 +3854,13 @@
         updatedAt: now,
         error: '',
       };
+      if (manualish) {
+        recordAiLearningExample({ ...user, handle: key, displayName: preview.displayName }, 'block', {
+          source: source || 'manual',
+          reason: preview.reason || '用户手动加入拉黑',
+          fingerprint: `manual_block:${key}:${now}`,
+        });
+      }
       added += 1;
     });
     writeGlobalBlockQueue(q);
@@ -3801,7 +3883,8 @@
     safeUsers.forEach(user => {
       if (!user) return;
       if (isAiHiddenHandle(user?.handle || '') || isAiExemptHandle(user?.handle || '')) return;
-      if (isStrongNameIssueMatch(user) || !useAiReview) directUsers.push(user);
+      if (useAiReview && userHasForeignLanguage(user)) reviewUsers.push(user);
+      else if (isStrongNameIssueMatch(user) || !useAiReview) directUsers.push(user);
       else reviewUsers.push(user);
     });
     const result = enqueueGlobalBlockUsers(directUsers, source);
@@ -3812,7 +3895,7 @@
     result.aiDirect = directUsers.length;
     result.aiReview = reviewUsers.length;
     const msg = useAiReview && reviewUsers.length
-      ? `已加入拉黑排队 ${result.added} 个${result.existing ? `，已有 ${result.existing} 个` : ''}${reviewUsers.length ? `，AI复核 ${reviewUsers.length} 个` : ''}${result.skipped ? `，跳过 ${result.skipped} 个` : ''}`
+      ? `已加入拉黑排队 ${result.added} 个${result.existing ? `，已有 ${result.existing} 个` : ''}${reviewUsers.length ? `，AI 判断 ${reviewUsers.length} 个` : ''}${result.skipped ? `，跳过 ${result.skipped} 个` : ''}`
       : `已加入拉黑排队 ${result.added} 个${result.existing ? `，已有 ${result.existing} 个` : ''}${result.skipped ? `，跳过 ${result.skipped} 个` : ''}`;
     if (result.added || result.existing || result.skipped || (useAiReview && reviewUsers.length)) showToast(msg, false);
     if (result.added || result.existing || reviewUsers.length) markCleanupButtonsComplete(opts.refreshButtonIds);
@@ -4067,7 +4150,7 @@
               source: next.source || 'manual',
             }, 'block', {
               source: next.source || 'manual',
-              reason: next.reason || 'manual block',
+              reason: next.reason || '用户手动加入拉黑',
               fingerprint: aiReviewFingerprint(next),
             });
           }
@@ -4135,7 +4218,7 @@
           if (resp.status >= 200 && resp.status < 300) resolve();
           else reject(new Error(`HTTP ${resp.status}`));
         },
-        onerror() { reject(new Error('Network error')); },
+        onerror() { reject(new Error('网络请求失败')); },
       });
     });
   }
@@ -4230,6 +4313,7 @@
     referral:  '#5f6f89',
     referralHot: '#f59e0b',
     hideOnlyHot: '#f2c14e',
+    foreign: '#2563eb',
   };
 
   const CAT_META = {
@@ -4238,6 +4322,7 @@
     suspect:  { label: '可疑关键词',         color: C.suspect },
     regex_kw: { label: '正则匹配',           color: C.regexKw },
     hide_only_regex: { label: '只隐藏正则', color: C.mute },
+    foreign: { label: '外语内容', color: C.foreign },
     liker:    { label: '列表用户',           color: C.mute },
     referral: { label: '导流号',             color: C.referral },
   };
@@ -4283,6 +4368,7 @@
       const ref = user.kwHits?.find?.(hit => hit.kw === '导流号' || hit.kw === '新号') || user.kwHits?.[0];
       lines.push(`${ref?.kw || '导流号'}: ${shortTooltipText(ref?.snippet || user.tweetSnippet || '账号主页规则命中')}`);
     }
+    if (user?.cats?.has?.('foreign')) lines.push('外语内容：交给 AI 判断是否拉黑');
     const matchText = hitTooltipFromMatchInfo(user || {});
     if (matchText) lines.push(matchText);
     return lines.join('\n');
@@ -4296,6 +4382,7 @@
     if ((user?.kwHits || []).length) parts.push(`内容关键词 ${user.kwHits.length}`);
     if ((user?.reHits || []).length) parts.push(`正则 ${user.reHits.length}`);
     if ((user?.hideOnlyReHits || []).length) parts.push(`只隐藏正则 ${user.hideOnlyReHits.length}`);
+    if (user?.cats?.has?.('foreign')) parts.push('外语');
     return parts.length ? `命中规则: ${parts.join(' / ')}` : '';
   }
 
@@ -4470,6 +4557,99 @@
     };
   }
 
+  function makeResizableFloatingPanel(el, sizeKey, positionKey, opts = {}) {
+    if (!el) return;
+    const gripClass = 'xfs-edge-resize-handle';
+    el.querySelectorAll(`.${gripClass}`).forEach(node => node.remove());
+    const optNum = (value, fallback) => {
+      const raw = typeof value === 'function' ? value() : value;
+      const n = Number(raw);
+      return Number.isFinite(n) && n > 0 ? n : fallback;
+    };
+    const minWidth = () => Math.max(80, optNum(opts.minWidth, 280));
+    const minHeight = () => Math.max(80, optNum(opts.minHeight, 220));
+    const maxWidth = () => Math.max(minWidth(), Math.min(optNum(opts.maxWidth, window.innerWidth - 8), window.innerWidth - 8));
+    const maxHeight = () => Math.max(minHeight(), Math.min(optNum(opts.maxHeight, window.innerHeight - 8), window.innerHeight - 8));
+    const saveState = () => {
+      writeFloatingPanelSize(sizeKey, { width: el.offsetWidth, height: el.offsetHeight });
+      writeFloatingPanelPosition(positionKey, { left: el.offsetLeft, top: el.offsetTop });
+      opts.onResizeEnd?.();
+    };
+    const applyRect = (dir, start, dx, dy) => {
+      let left = start.left;
+      let top = start.top;
+      let width = start.width;
+      let height = start.height;
+
+      if (dir.includes('e')) {
+        width = Math.max(minWidth(), Math.min(maxWidth(), start.width + dx, window.innerWidth - start.left - 8));
+      }
+      if (dir.includes('w')) {
+        const right = start.left + start.width;
+        width = Math.max(minWidth(), Math.min(maxWidth(), start.width - dx, right));
+        left = right - width;
+      }
+      if (dir.includes('s')) {
+        height = Math.max(minHeight(), Math.min(maxHeight(), start.height + dy, window.innerHeight - start.top - 8));
+      }
+      if (dir.includes('n')) {
+        const bottom = start.top + start.height;
+        height = Math.max(minHeight(), Math.min(maxHeight(), start.height - dy, bottom));
+        top = bottom - height;
+      }
+
+      const pos = clampFloatingPanelPosition({ left, top }, width, height);
+      el.style.left = `${Math.round(pos.left)}px`;
+      el.style.top = `${Math.round(pos.top)}px`;
+      el.style.right = 'auto';
+      el.style.bottom = 'auto';
+      el.style.width = `${Math.round(width)}px`;
+      el.style.height = `${Math.round(height)}px`;
+      opts.onResize?.({ left: pos.left, top: pos.top, width, height });
+    };
+    const grips = [
+      ['n', 'top:0;left:12px;right:12px;height:8px;cursor:ns-resize;'],
+      ['s', 'bottom:0;left:12px;right:12px;height:8px;cursor:ns-resize;'],
+      ['e', 'top:12px;right:0;bottom:12px;width:8px;cursor:ew-resize;'],
+      ['w', 'top:12px;left:0;bottom:12px;width:8px;cursor:ew-resize;'],
+      ['nw', 'top:0;left:0;width:14px;height:14px;cursor:nwse-resize;'],
+      ['ne', 'top:0;right:0;width:14px;height:14px;cursor:nesw-resize;'],
+      ['sw', 'bottom:0;left:0;width:14px;height:14px;cursor:nesw-resize;'],
+      ['se', 'bottom:0;right:0;width:14px;height:14px;cursor:nwse-resize;'],
+    ];
+    grips.forEach(([dir, css]) => {
+      const grip = document.createElement('div');
+      grip.className = gripClass;
+      grip.dataset.xfsResizeDir = dir;
+      grip.title = '拖动边框调整大小';
+      grip.style.cssText = `position:absolute;${css}z-index:8;background:transparent;touch-action:none;user-select:none;`;
+      grip.onpointerdown = e => {
+        if (e.button != null && e.button !== 0) return;
+        e.preventDefault();
+        e.stopPropagation();
+        const start = {
+          x: e.clientX,
+          y: e.clientY,
+          left: el.offsetLeft,
+          top: el.offsetTop,
+          width: el.offsetWidth,
+          height: el.offsetHeight,
+        };
+        grip.setPointerCapture?.(e.pointerId);
+        const onMove = ev => applyRect(dir, start, ev.clientX - start.x, ev.clientY - start.y);
+        const onUp = ev => {
+          grip.releasePointerCapture?.(ev.pointerId);
+          window.removeEventListener('pointermove', onMove);
+          window.removeEventListener('pointerup', onUp);
+          saveState();
+        };
+        window.addEventListener('pointermove', onMove);
+        window.addEventListener('pointerup', onUp, { once: true });
+      };
+      el.appendChild(grip);
+    });
+  }
+
   function showPanel(allUsers, opts = {}) {
     document.getElementById('xfs-panel')?.remove();
     document.getElementById('xfs-panel-dock')?.remove();
@@ -4491,6 +4671,7 @@
       if (isGlobalQueueView && u.queueRowCat) return u.queueRowCat;
       if (u.cats.has('heart'))    return 'heart';
       if (u.cats.has('name_kw')) return 'name_kw';
+      if (u.cats.has('foreign')) return 'foreign';
       if (u.cats.has('referral')) return 'referral';
       if (u.cats.has('liker'))   return 'liker';
       if (u.cats.has('regex_kw')) return 'regex_kw';
@@ -4499,8 +4680,9 @@
     const ordered = [
       ...topUsers.filter(u => u.cats.has('heart')),
       ...topUsers.filter(u => !u.cats.has('heart') && u.cats.has('name_kw')),
-      ...topUsers.filter(u => !u.cats.has('heart') && !u.cats.has('name_kw') && u.cats.has('referral')),
-      ...topUsers.filter(u => !u.cats.has('heart') && !u.cats.has('name_kw') && !u.cats.has('referral')),
+      ...topUsers.filter(u => !u.cats.has('heart') && !u.cats.has('name_kw') && u.cats.has('foreign')),
+      ...topUsers.filter(u => !u.cats.has('heart') && !u.cats.has('name_kw') && !u.cats.has('foreign') && u.cats.has('referral')),
+      ...topUsers.filter(u => !u.cats.has('heart') && !u.cats.has('name_kw') && !u.cats.has('foreign') && !u.cats.has('referral')),
     ];
 
     // ── Adaptive column count & panel width ──
@@ -4545,7 +4727,6 @@
       isGlobalQueueView ? 'border-radius:10px' : 'border-radius:0 10px 10px 0',
       isGlobalQueueView ? 'box-shadow:0 8px 28px rgba(0,0,0,0.16)' : 'box-shadow:4px 0 24px rgba(0,0,0,0.14)',
       'display:flex', 'flex-direction:column', 'overflow:hidden',
-      isGlobalQueueView ? 'resize:both' : '',
       isGlobalQueueView ? 'min-width:360px' : '',
       isGlobalQueueView ? 'min-height:260px' : '',
       isGlobalQueueView ? 'max-width:calc(100vw - 16px)' : '',
@@ -4596,8 +4777,8 @@
     countBadge.style.cssText = `font-size:10px;color:${C.mute};background:${C.mute}12;border:1px solid ${C.mute}55;border-radius:999px;padding:1px 6px;white-space:nowrap;`;
 
     const authDot = document.createElement('span');
-    authDot.title = liveBearer ? 'Auth token captured from page' : 'Using fallback token';
-    authDot.textContent = liveBearer ? 'auth ok' : 'auth?';
+    authDot.title = liveBearer ? '已从当前页面读取登录凭证' : '正在使用备用登录凭证';
+    authDot.textContent = liveBearer ? '凭证正常' : '凭证待确认';
     authDot.style.cssText = `font-size:10px;padding:1px 5px;border-radius:8px;background:${liveBearer ? '#d4edda' : '#fff3cd'};color:${liveBearer ? '#155724' : '#856404'};`;
 
     const closeBtn = document.createElement('button');
@@ -4616,6 +4797,50 @@
     hdr.appendChild(authDot);
     hdr.appendChild(dockBtn);
     hdr.appendChild(closeBtn);
+
+    let detailTab = isGlobalQueueView ? String(GM_getValue(GLOBAL_BLOCK_QUEUE_DETAIL_TAB_KEY, 'queue') || 'queue') : 'queue';
+    if (!['queue', 'ai', 'learning'].includes(detailTab)) detailTab = 'queue';
+    const globalStatusBar = document.createElement('div');
+    globalStatusBar.style.cssText = `display:${isGlobalQueueView ? 'flex' : 'none'};align-items:center;justify-content:space-between;gap:8px;padding:5px 12px;border-bottom:1px solid ${C.border};background:${C.catBg};font-size:11px;color:${C.sub};flex-shrink:0;`;
+    const globalStatusText = document.createElement('div');
+    globalStatusText.style.cssText = 'flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+    globalStatusText.textContent = isGlobalQueueView ? globalQueueStatusText(readGlobalBlockQueue()) : '';
+    const globalTabs = document.createElement('div');
+    globalTabs.style.cssText = 'display:flex;gap:4px;align-items:center;flex-shrink:0;';
+    const globalTabButtons = {};
+    const setGlobalDetailTab = next => {
+      detailTab = ['queue', 'ai', 'learning'].includes(next) ? next : 'queue';
+      GM_setValue(GLOBAL_BLOCK_QUEUE_DETAIL_TAB_KEY, detailTab);
+      Object.entries(globalTabButtons).forEach(([key, btn]) => {
+        const active = key === detailTab;
+        btn.style.background = active ? C.text : '#fff';
+        btn.style.color = active ? '#fff' : C.sub;
+        btn.style.borderColor = active ? C.text : C.btnBorder;
+      });
+      body.style.display = detailTab === 'queue' ? '' : 'none';
+      aiWorkLogSection.style.display = detailTab === 'ai' ? 'flex' : 'none';
+      aiLearningSection.style.display = detailTab === 'learning' ? 'flex' : 'none';
+      ftr.style.display = detailTab === 'queue' ? 'flex' : 'none';
+      rateNote.style.display = detailTab === 'queue' ? '' : 'none';
+      if (detailTab === 'queue') requestAnimationFrame(syncColumnHeight);
+      if (detailTab === 'ai') refreshAiWorkLogPanelFn?.();
+      if (detailTab === 'learning') refreshAiLearningPanelFn?.();
+    };
+    [
+      ['queue', '队列'],
+      ['ai', 'AI 判断'],
+      ['learning', 'AI 学习'],
+    ].forEach(([key, label]) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = label;
+      b.style.cssText = `border:1px solid ${C.btnBorder};background:#fff;color:${C.sub};border-radius:999px;padding:2px 8px;font-size:10px;font-weight:800;cursor:pointer;`;
+      b.onclick = () => setGlobalDetailTab(key);
+      globalTabButtons[key] = b;
+      globalTabs.appendChild(b);
+    });
+    globalStatusBar.appendChild(globalStatusText);
+    globalStatusBar.appendChild(globalTabs);
 
     // ── Keyword management bar ──
     const kwBar = document.createElement('div');
@@ -5280,6 +5505,31 @@
 
     body.appendChild(colContainer);
 
+    const aiWorkLogSection = document.createElement('div');
+    aiWorkLogSection.style.cssText = 'flex:1;min-height:0;overflow:auto;padding:7px 8px;display:none;flex-direction:column;gap:6px;background:#fff;';
+    const aiWorkLogStatus = document.createElement('div');
+    aiWorkLogStatus.style.cssText = `font-size:10px;line-height:1.35;color:${C.sub};word-break:break-word;padding:0 2px 4px;border-bottom:1px solid ${C.border};`;
+    const aiWorkLogList = document.createElement('div');
+    aiWorkLogList.style.cssText = 'display:flex;flex-direction:column;gap:0;';
+    aiWorkLogSection.appendChild(aiWorkLogStatus);
+    aiWorkLogSection.appendChild(aiWorkLogList);
+
+    const aiLearningSection = document.createElement('div');
+    aiLearningSection.style.cssText = 'flex:1;min-height:0;overflow:auto;padding:7px 8px;display:none;flex-direction:column;gap:6px;background:#fff;';
+    const aiLearningStatus = document.createElement('div');
+    aiLearningStatus.style.cssText = `font-size:10px;line-height:1.35;color:${C.sub};word-break:break-word;padding:0 2px 4px;border-bottom:1px solid ${C.border};`;
+    const aiLearningList = document.createElement('div');
+    aiLearningList.style.cssText = 'display:flex;flex-direction:column;gap:0;';
+    aiLearningSection.appendChild(aiLearningStatus);
+    aiLearningSection.appendChild(aiLearningList);
+
+    if (isGlobalQueueView) {
+      refreshAiWorkLogPanelFn = () => renderAiWorkLogRows(aiWorkLogList, aiWorkLogStatus);
+      refreshAiLearningPanelFn = () => renderAiLearningRows(aiLearningList, aiLearningStatus);
+      refreshAiWorkLogPanelFn();
+      refreshAiLearningPanelFn();
+    }
+
     // ── Hint bar (revealed after blocking completes) ──
     const hint = document.createElement('div');
     hint.style.cssText = `padding:5px 12px;border-top:1px solid ${C.border};font-size:11px;color:${C.sub};text-align:center;flex-shrink:0;display:none;background:${C.catBg};`;
@@ -5445,8 +5695,13 @@
     scriptFtr.appendChild(xBlockedLink);
 
     panel.appendChild(hdr);
+    if (isGlobalQueueView) panel.appendChild(globalStatusBar);
     panel.appendChild(kwBar);
     panel.appendChild(body);
+    if (isGlobalQueueView) {
+      panel.appendChild(aiWorkLogSection);
+      panel.appendChild(aiLearningSection);
+    }
     panel.appendChild(ftr);
     panel.appendChild(hint);
     panel.appendChild(rateNote);
@@ -5457,9 +5712,17 @@
     };
     let resizeSaveTimer = null;
     let panelResizeObserver = null;
+    let globalStatusTimer = null;
+    const refreshGlobalStatusLine = () => {
+      if (!isGlobalQueueView) return;
+      const text = globalQueueStatusText(readGlobalBlockQueue());
+      globalStatusText.textContent = text;
+      globalStatusText.title = text;
+    };
     if (isGlobalQueueView && typeof ResizeObserver !== 'undefined') {
       panelResizeObserver = new ResizeObserver(() => {
         syncColumnHeight();
+        refreshGlobalStatusLine();
         clearTimeout(resizeSaveTimer);
         resizeSaveTimer = setTimeout(() => {
           writeFloatingPanelSize(GLOBAL_BLOCK_QUEUE_SIZE_KEY, {
@@ -5475,6 +5738,17 @@
       });
       panelResizeObserver.observe(panel);
     }
+    if (isGlobalQueueView) {
+      makeResizableFloatingPanel(panel, GLOBAL_BLOCK_QUEUE_SIZE_KEY, panelPosKey, {
+        minWidth: 360,
+        minHeight: 260,
+        onResize: syncColumnHeight,
+        onResizeEnd: () => requestAnimationFrame(updateGlobalBlockQueuePanel),
+      });
+      setGlobalDetailTab(detailTab);
+      refreshGlobalStatusLine();
+      globalStatusTimer = setInterval(refreshGlobalStatusLine, 1000);
+    }
     requestAnimationFrame(updateGlobalBlockQueuePanel);
 
     // Escape key closes panel
@@ -5487,8 +5761,13 @@
       dockCaption = null;
       dockRestoreBtn = null;
       dockRefreshBtn = null;
+      if (isGlobalQueueView) {
+        refreshAiWorkLogPanelFn = null;
+        refreshAiLearningPanelFn = null;
+      }
       if (panelResizeObserver) panelResizeObserver.disconnect();
       clearTimeout(resizeSaveTimer);
+      if (globalStatusTimer) clearInterval(globalStatusTimer);
       document.removeEventListener('keydown', onEsc);
       if (isGlobalQueueView) updateGlobalBlockQueuePanel();
     };
@@ -5844,6 +6123,10 @@
       const handle = art.dataset.xfsReferralHandle || extractHandleFromArticle(art);
       const key = normalizeHandle(handle);
       if (!key) return;
+      if (isAiExemptHandle(key)) {
+        clearVisibleStateForAiExemptHandle(key);
+        return;
+      }
       const displayName = extractDisplayNameFromArticle(art, key) || key;
       const textEl = art.querySelector('[data-testid="tweetText"]');
       const cardEl = art.querySelector('[data-testid="card.wrapper"]');
@@ -6229,7 +6512,7 @@
       'border:1px solid rgba(207,217,222,0.82)', 'border-radius:8px',
       'box-shadow:0 6px 22px rgba(15,20,25,0.10)',
       'font-size:11px', 'line-height:1.35',
-      'resize:both', 'overflow:auto',
+      'overflow:auto',
       'min-width:136px', 'min-height:118px',
       'max-width:calc(100vw - 16px)', 'max-height:calc(100vh - 16px)',
       `font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif`,
@@ -6455,6 +6738,11 @@
     hdr.appendChild(actionGrid);
     makeGlobalBlockQueuePanelDraggable(p, hdr);
     p.appendChild(hdr);
+    makeResizableFloatingPanel(p, GLOBAL_BLOCK_QUEUE_SIZE_KEY, GLOBAL_BLOCK_QUEUE_POS_KEY, {
+      minWidth: 280,
+      minHeight: 118,
+      onResizeEnd: () => avoidGlobalQueuePanelOverlap(p),
+    });
     avoidGlobalQueuePanelOverlap(p);
   }
 
@@ -6482,7 +6770,6 @@
       ['xfs-sweep-btn', 320, 0],
       ['xfs-queue-btn', 320, 40],
       ['xfs-btn', 360, 0],
-      ['xfs-ai-log-btn', 360, 40],
       ['xfs-hide-btn', 400, 0],
       ['xfs-btn-backdrop', 196, -4],
       ['xfs-btn-section-settings', 200, -2],
@@ -7197,7 +7484,7 @@
     refreshHideOnlyRulesControls();
 
     function refreshAiReviewControls() {
-      aiReviewBtn.textContent = `AI 复核：${aiReviewActive ? '开' : '关'}`;
+      aiReviewBtn.textContent = `AI 判断：${aiReviewActive ? '开' : '关'}`;
       aiReviewBtn.style.borderColor = aiReviewActive ? C.nameKw : C.btnBorder;
       aiReviewBtn.style.color = aiReviewActive ? C.nameKw : C.sub;
       aiReviewBtn.style.background = aiReviewActive ? '#f2fbfc' : '#fff';
@@ -7208,25 +7495,26 @@
       aiReviewModelInput.value = aiReviewModel();
       aiReviewKeyInput.value = aiReviewApiKey();
       aiReviewStatus.textContent = aiReviewConfigured()
-        ? `模型 ${aiReviewModelInput.value || aiReviewModel()} · key 已配置 · 学习样本 ${aiLearningExamples.length} 条 · 自动改规则 ${aiAutoRulesActive ? '开' : '关'}`
-        : (aiReviewActive ? '已开启，但尚未配置 API key' : '默认关闭；开启后，非用户名命中的可疑账号会先送 AI 复核。');
+        ? `模型 ${aiReviewModelInput.value || aiReviewModel()} · API key 已保存 · 学习样本 ${aiLearningExamples.length} 条 · 自动改规则 ${aiAutoRulesActive ? '开' : '关'}`
+        : (aiReviewActive ? '已开启，但还没有保存 API key' : '默认关闭；开启后，含外语或非用户名强命中的可疑账号会交给 AI 判断是否拉黑。');
       aiReviewStatus.title = aiReviewStatus.textContent;
     }
     refreshAiReviewControlsFn = refreshAiReviewControls;
 
     const aiReviewWrap = document.createElement('div');
     aiReviewWrap.style.cssText = `border:1px solid ${C.nameKw};background:#f7feff;border-radius:8px;padding:7px;display:flex;flex-direction:column;gap:6px;`;
+    aiReviewWrap.style.gridColumn = '1 / -1';
     const aiReviewTitle = document.createElement('div');
-    aiReviewTitle.textContent = 'AI 复核';
+    aiReviewTitle.textContent = 'AI 判断';
     aiReviewTitle.style.cssText = `font-size:11px;font-weight:800;color:${C.nameKw};`;
     const aiReviewNote = document.createElement('div');
-    aiReviewNote.textContent = '用户名/昵称问题直接拉黑；其余可疑账号交给 AI 复核。AI 只做 block / hide / ignore 三选一。';
+    aiReviewNote.textContent = '用户名/昵称强命中直接拉黑；含外语或其余可疑账号交给 AI 判断。AI 只给出“拉黑 / 放行”，放行后不再隐藏或拉黑。';
     aiReviewNote.style.cssText = `font-size:10px;line-height:1.35;color:${C.sub};`;
     const aiReviewBtn = mkToolBtn('', () => {
       aiReviewActive = !aiReviewActive;
       GM_setValue(AI_REVIEW_ENABLED_KEY, aiReviewActive);
       refreshAiReviewControls();
-      showToast(aiReviewActive ? 'AI 复核已开启' : 'AI 复核已关闭', false);
+      showToast(aiReviewActive ? 'AI 判断已开启' : 'AI 判断已关闭', false);
     });
     const aiAutoRuleBtn = mkToolBtn('', () => {
       aiAutoRulesActive = !aiAutoRulesActive;
@@ -7234,9 +7522,9 @@
       refreshAiReviewControls();
       showToast(aiAutoRulesActive ? 'AI 自动改规则已开启' : 'AI 自动改规则已关闭', false);
     });
-    const aiReviewTestBtn = mkToolBtn('AI 试跑', async () => {
+    const aiReviewTestBtn = mkToolBtn('测试 AI 判断', async () => {
       if (!aiReviewConfigured()) {
-        showToast('先开启 AI 复核并保存 API key', true);
+        showToast('先开启 AI 判断并保存 API key', true);
         return;
       }
       const probeUser = {
@@ -7250,7 +7538,7 @@
         reHits: [],
       };
       aiReviewTestBtn.disabled = true;
-      aiReviewTestBtn.textContent = 'AI 试跑中...';
+      aiReviewTestBtn.textContent = '测试中...';
       try {
         const decision = await requestAiReviewDecision(probeUser, { queueSource: 'manual_test' });
         recordAiWorkLog({
@@ -7265,7 +7553,7 @@
           ruleSuggestion: decision.ruleSuggestion || null,
           fingerprint: `probe:${stableStringHash(`${probeUser.handle}:${decision.action}:${decision.reason}`)}`,
         });
-        showToast(`AI 试跑成功：${decision.action} · ${decision.reason}`, false);
+        showToast(`AI 测试成功：${aiReviewActionLabel(decision.action)} · ${decision.reason}`, false);
       } catch (e) {
         recordAiWorkLog({
           kind: 'test',
@@ -7274,16 +7562,16 @@
           handle: probeUser.handle,
           displayName: probeUser.displayName,
           source: 'manual_test',
-          reason: e?.message || String(e || 'AI 试跑失败'),
+          reason: e?.message || String(e || 'AI 测试失败'),
           confidence: 0,
           fingerprint: `probe:${stableStringHash(`error:${e?.message || e || 'failed'}`)}`,
         });
-        showToast(`AI 试跑失败：${e?.message || String(e || 'unknown')}`, true);
+        showToast(`AI 测试失败：${e?.message || String(e || 'unknown')}`, true);
       } finally {
         aiReviewTestBtn.disabled = false;
-        aiReviewTestBtn.textContent = 'AI 试跑';
+        aiReviewTestBtn.textContent = '测试 AI 判断';
         if (typeof refreshAiWorkLogPanelFn === 'function') refreshAiWorkLogPanelFn();
-        refreshAiLearningControls();
+        if (typeof refreshAiLearningPanelFn === 'function') refreshAiLearningPanelFn();
       }
     });
     aiReviewTestBtn.style.borderColor = C.nameKw;
@@ -7317,7 +7605,7 @@
               }
             },
             onerror() {
-              reject(new Error('Network error'));
+              reject(new Error('网络请求失败'));
             },
           });
         });
@@ -7332,11 +7620,11 @@
           handle: 'api_key',
           displayName: 'OpenAI API key',
           source: 'manual_test',
-          reason: `API key 有效，models=${total}`,
+          reason: `API key 有效，可读取模型 ${total} 个`,
           confidence: 1,
           fingerprint: `keycheck:${stableStringHash(`${apiKey.slice(0, 8)}:${total}`)}`,
         });
-        showToast(`API key 有效 · models ${total}`, false);
+        showToast(`API key 有效，可读取模型 ${total} 个`, false);
       } catch (e) {
         recordAiWorkLog({
           kind: 'key_check',
@@ -7399,60 +7687,6 @@
     aiReviewWrap.appendChild(aiReviewClearBtn);
     aiReviewWrap.appendChild(aiReviewStatus);
     refreshAiReviewControls();
-
-    const aiLearningWrap = document.createElement('div');
-    aiLearningWrap.style.cssText = `border:1px solid ${C.regexKw};background:#f6fbff;border-radius:8px;padding:7px;display:flex;flex-direction:column;gap:6px;`;
-    const aiLearningTitle = document.createElement('div');
-    aiLearningTitle.textContent = 'AI 学习调试';
-    aiLearningTitle.style.cssText = `font-size:11px;font-weight:800;color:${C.regexKw};`;
-    const aiLearningStatus = document.createElement('div');
-    aiLearningStatus.style.cssText = `font-size:10px;line-height:1.35;color:${C.sub};word-break:break-word;`;
-    const aiLearningList = document.createElement('div');
-    aiLearningList.style.cssText = `display:flex;flex-direction:column;gap:4px;max-height:140px;overflow:auto;padding-right:2px;`;
-    const aiLearningRefreshBtn = mkToolBtn('刷新学习样本', () => {
-      refreshAiReviewControls();
-      refreshAiLearningControls();
-      showToast('AI 学习样本已刷新', false);
-    });
-    const aiLearningClearBtn = mkToolBtn('清空学习样本', () => {
-      if (!window.confirm('清空所有 AI 学习样本和最近一次写入记录？')) return;
-      aiLearningExamples = [];
-      GM_setValue(AI_LEARNING_EXAMPLES_KEY, []);
-      GM_setValue(AI_LEARNING_LAST_KEY, null);
-      refreshAiReviewControls();
-      refreshAiLearningControls();
-      showToast('AI 学习样本已清空', false);
-    });
-    function refreshAiLearningControls() {
-      const last = loadAiLearningLast();
-      const rawCount = Array.isArray(GM_getValue(AI_LEARNING_EXAMPLES_KEY, [])) ? GM_getValue(AI_LEARNING_EXAMPLES_KEY, []).length : 0;
-      aiLearningStatus.textContent = last
-        ? `存储 ${aiLearningExamples.length} 条 / 原始 ${rawCount} 条 · 最近一次 ${last.label} @${last.handle || '-'}${last.source ? ` · ${last.source}` : ''}${last.reason ? ` · ${last.reason}` : ''}`
-        : `存储 ${aiLearningExamples.length} 条 / 原始 ${rawCount} 条 · 还没有写入过学习样本`;
-      aiLearningStatus.title = aiLearningStatus.textContent;
-      aiLearningList.textContent = '';
-      const items = aiLearningExamples.slice(0, 8);
-      if (!items.length) {
-        const empty = document.createElement('div');
-        empty.textContent = '暂无学习样本';
-        empty.style.cssText = `font-size:10px;color:${C.sub};padding:4px 0;`;
-        aiLearningList.appendChild(empty);
-        return;
-      }
-      items.forEach(item => {
-        const row = document.createElement('div');
-        row.style.cssText = `padding:4px 6px;border:1px solid ${C.border};border-radius:6px;background:#fff;font-size:10px;line-height:1.35;word-break:break-word;`;
-        row.textContent = `${item.label} · @${item.handle || '-'}${item.displayName ? ` (${item.displayName})` : ''}${item.source ? ` · ${item.source}` : ''}${item.reason ? ` · ${item.reason}` : ''}`;
-        aiLearningList.appendChild(row);
-      });
-    }
-    refreshAiLearningControlsFn = refreshAiLearningControls;
-    aiLearningWrap.appendChild(aiLearningTitle);
-    aiLearningWrap.appendChild(aiLearningRefreshBtn);
-    aiLearningWrap.appendChild(aiLearningClearBtn);
-    aiLearningWrap.appendChild(aiLearningStatus);
-    aiLearningWrap.appendChild(aiLearningList);
-    refreshAiLearningControls();
 
     function refreshRemoteRulesControls() {
       remoteRulesBtn.textContent = `远程规则订阅：${remoteRulesActive ? '开' : '关'}`;
@@ -7659,7 +7893,6 @@
     grid.appendChild(verifiedProtectBtn);
     grid.appendChild(hideOnlyRulesBtn);
     grid.appendChild(aiReviewWrap);
-    grid.appendChild(aiLearningWrap);
     grid.appendChild(remoteWrap);
     grid.appendChild(youngWrap);
     grid.appendChild(mkToolBtn('两类账号说明', showCategoryHelp));
@@ -7882,9 +8115,10 @@
             blockedHandles.delete(normalizeHandle(handle));
             undimArticlesByHandle(handle);
             purgeAiMemoryForHandle(handle);
-            rememberAiExemptHandle(handle, { source: 'manual_unblock', reason: 'manual unblock' });
-            recordAiLearningExample({ handle, displayName, source: 'manual_unblock' }, 'ignore', { reason: 'manual unblock' });
-            showToast(`@${handle} 已取消拉黑`, false);
+            rememberAiExemptHandle(handle, { source: 'manual_unblock', reason: '用户手动取消拉黑' });
+            recordAiLearningExample({ handle, displayName, source: 'manual_unblock' }, 'ignore', { reason: '用户手动取消拉黑' });
+            clearVisibleStateForAiExemptHandle(handle);
+            showToast(`@${handle} 已取消拉黑，并加入放行名单`, false);
             document.querySelectorAll(`button[data-xfs-handle="${CSS.escape(handle)}"]`).forEach(b => {
               b.dataset.xfsState = 'unblocked';
               b.disabled         = false;
@@ -8139,7 +8373,6 @@
     document.getElementById('xfs-referral-scan-btn')?.remove();
     document.getElementById('xfs-sweep-btn')?.remove();
     document.getElementById('xfs-queue-btn')?.remove();
-    document.getElementById('xfs-ai-log-btn')?.remove();
     removeGearBtn();
     removeReferralBtn();
     removeHideBtn();
@@ -8189,10 +8422,6 @@
           globalQueuePanelSuppressed = false;
           showGlobalBlockQueueDetailPanel(true);
         }));
-    }
-    if (!document.getElementById('xfs-ai-log-btn')) {
-      document.body.appendChild(mkIconBtn(
-        'xfs-ai-log-btn', 'AI', '打开 AI 工作记录', 360, C.regexKw, showAiWorkLogPanel));
     }
     updateToolbarPositions();
     updateScanButtonsLocked();
@@ -8358,7 +8587,7 @@
     const ids = isListPage(p) ? ['xfs-list-btn']
               : /\/status\/\d/.test(p) ? (buttonsCollapsed
                 ? ['xfs-stack-toggle-btn']
-                : ['xfs-stack-toggle-btn', 'xfs-btn-backdrop', 'xfs-hide-btn', 'xfs-referral-btn', 'xfs-btn', 'xfs-ai-log-btn', 'xfs-referral-scan-btn', 'xfs-sweep-btn', 'xfs-gear-btn'])
+                : ['xfs-stack-toggle-btn', 'xfs-btn-backdrop', 'xfs-hide-btn', 'xfs-referral-btn', 'xfs-btn', 'xfs-referral-scan-btn', 'xfs-sweep-btn', 'xfs-gear-btn'])
               : p === '/home' ? ['xfs-gear-btn'] : [];
     return ids.every(id => document.getElementById(id));
   }
