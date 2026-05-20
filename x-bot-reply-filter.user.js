@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         垃圾推号大扫除 - 自用版
 // @namespace    http://tampermonkey.net/
-// @version      6.18.8
+// @version      6.18.9
 // @description  扫描推文回复中的垃圾用户批量拉黑
 // @author       summeriscoming
 // @license MIT
@@ -7042,6 +7042,131 @@
       refreshAiReviewControls();
       showToast(aiAutoRulesActive ? 'AI 自动改规则已开启' : 'AI 自动改规则已关闭', false);
     });
+    const aiReviewTestBtn = mkToolBtn('AI 试跑', async () => {
+      if (!aiReviewConfigured()) {
+        showToast('先开启 AI 复核并保存 API key', true);
+        return;
+      }
+      const probeUser = {
+        handle: 'xfs_ai_probe',
+        displayName: '同城 ❤️ 测试号',
+        tweetSnippet: '同城找搭子，互关❤️',
+        cats: new Set(['heart', 'name_kw']),
+        heartHits: ['❤️'],
+        nameKwHits: ['同城'],
+        kwHits: [{ kw: '搭子', snippet: '同城找搭子，互关❤️' }],
+        reHits: [],
+      };
+      aiReviewTestBtn.disabled = true;
+      aiReviewTestBtn.textContent = 'AI 试跑中...';
+      try {
+        const decision = await requestAiReviewDecision(probeUser, { queueSource: 'manual_test' });
+        recordAiWorkLog({
+          kind: 'test',
+          label: decision.action,
+          action: decision.action,
+          handle: probeUser.handle,
+          displayName: probeUser.displayName,
+          source: 'manual_test',
+          reason: decision.reason,
+          confidence: decision.confidence,
+          ruleSuggestion: decision.ruleSuggestion || null,
+          fingerprint: `probe:${stableStringHash(`${probeUser.handle}:${decision.action}:${decision.reason}`)}`,
+        });
+        showToast(`AI 试跑成功：${decision.action} · ${decision.reason}`, false);
+      } catch (e) {
+        recordAiWorkLog({
+          kind: 'test',
+          label: 'ignore',
+          action: 'ignore',
+          handle: probeUser.handle,
+          displayName: probeUser.displayName,
+          source: 'manual_test',
+          reason: e?.message || String(e || 'AI 试跑失败'),
+          confidence: 0,
+          fingerprint: `probe:${stableStringHash(`error:${e?.message || e || 'failed'}`)}`,
+        });
+        showToast(`AI 试跑失败：${e?.message || String(e || 'unknown')}`, true);
+      } finally {
+        aiReviewTestBtn.disabled = false;
+        aiReviewTestBtn.textContent = 'AI 试跑';
+        refreshAiWorkLogControls();
+        refreshAiLearningControls();
+      }
+    });
+    aiReviewTestBtn.style.borderColor = C.nameKw;
+    aiReviewTestBtn.style.color = C.nameKw;
+    aiReviewTestBtn.style.background = '#f2fbfc';
+    const aiKeyTestBtn = mkToolBtn('检测 API key', async () => {
+      const apiKey = aiReviewApiKey();
+      if (!apiKey) {
+        showToast('还没有保存 OpenAI API key', true);
+        return;
+      }
+      aiKeyTestBtn.disabled = true;
+      aiKeyTestBtn.textContent = '检测中...';
+      try {
+        const result = await new Promise((resolve, reject) => {
+          GM_xmlhttpRequest({
+            method: 'GET',
+            url: 'https://api.openai.com/v1/models',
+            headers: {
+              authorization: `Bearer ${apiKey}`,
+            },
+            onload(resp) {
+              if (resp.status >= 200 && resp.status < 300) {
+                resolve({
+                  status: resp.status,
+                  ok: true,
+                  body: resp.responseText || '',
+                });
+              } else {
+                reject(new Error(`HTTP ${resp.status}`));
+              }
+            },
+            onerror() {
+              reject(new Error('Network error'));
+            },
+          });
+        });
+        const parsed = (() => {
+          try { return JSON.parse(result.body || '{}'); } catch (_) { return null; }
+        })();
+        const total = Array.isArray(parsed?.data) ? parsed.data.length : 0;
+        recordAiWorkLog({
+          kind: 'key_check',
+          label: 'ignore',
+          action: 'ignore',
+          handle: 'api_key',
+          displayName: 'OpenAI API key',
+          source: 'manual_test',
+          reason: `API key 有效，models=${total}`,
+          confidence: 1,
+          fingerprint: `keycheck:${stableStringHash(`${apiKey.slice(0, 8)}:${total}`)}`,
+        });
+        showToast(`API key 有效 · models ${total}`, false);
+      } catch (e) {
+        recordAiWorkLog({
+          kind: 'key_check',
+          label: 'ignore',
+          action: 'ignore',
+          handle: 'api_key',
+          displayName: 'OpenAI API key',
+          source: 'manual_test',
+          reason: e?.message || String(e || 'key check failed'),
+          confidence: 0,
+          fingerprint: `keycheck:${stableStringHash(`error:${e?.message || e || 'failed'}`)}`,
+        });
+        showToast(`API key 检测失败：${e?.message || String(e || 'unknown')}`, true);
+      } finally {
+        aiKeyTestBtn.disabled = false;
+        aiKeyTestBtn.textContent = '检测 API key';
+        refreshAiWorkLogControls();
+      }
+    });
+    aiKeyTestBtn.style.borderColor = C.regexKw;
+    aiKeyTestBtn.style.color = C.regexKw;
+    aiKeyTestBtn.style.background = '#f6fbff';
     const aiReviewModelInput = document.createElement('input');
     aiReviewModelInput.type = 'text';
     aiReviewModelInput.placeholder = AI_REVIEW_DEFAULT_MODEL;
@@ -7075,6 +7200,8 @@
     aiReviewWrap.appendChild(aiReviewTitle);
     aiReviewWrap.appendChild(aiReviewBtn);
     aiReviewWrap.appendChild(aiAutoRuleBtn);
+    aiReviewWrap.appendChild(aiReviewTestBtn);
+    aiReviewWrap.appendChild(aiKeyTestBtn);
     aiReviewWrap.appendChild(aiReviewModelInput);
     aiReviewWrap.appendChild(aiReviewKeyInput);
     aiReviewWrap.appendChild(aiReviewClearBtn);
@@ -7455,7 +7582,7 @@
 
     setTimeout(() => {
       const onDown = e => {
-        if (p.contains(e.target) || e.target?.closest?.('#xfs-gear-btn, #xfs-queue-btn, #xfs-global-block-queue')) return;
+        if (p.contains(e.target) || e.target?.closest?.('#xfs-gear-btn, #xfs-queue-btn, #xfs-global-block-queue, #xfs-panel[data-xfs-global-queue-view="1"]')) return;
         closeToolsPanel();
         document.removeEventListener('mousedown', onDown, true);
       };
