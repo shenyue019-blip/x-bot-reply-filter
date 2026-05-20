@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         垃圾推号大扫除 - 自用版
 // @namespace    http://tampermonkey.net/
-// @version      6.18.5
+// @version      6.18.6
 // @description  扫描推文回复中的垃圾用户批量拉黑
 // @author       summeriscoming
 // @license MIT
@@ -587,6 +587,7 @@
   const AI_EXEMPT_HANDLES_KEY = 'xfs-ai-exempt-handles-v1';
   const AI_EXEMPT_HANDLES_MAX = 2000;
   const AI_LEARNING_EXAMPLES_KEY = 'xfs-ai-learning-examples-v1';
+  const AI_LEARNING_LAST_KEY = 'xfs-ai-learning-last-v1';
   const AI_LEARNING_EXAMPLES_MAX = 300;
   const AI_AUTO_RULES_KEY = 'xfs-ai-auto-rules-v1';
   const AI_REVIEW_DEFAULT_MODEL = 'gpt-5.5';
@@ -639,6 +640,7 @@
   let globalQueuePanelDragging = false;
   let globalQueuePanelSuppressed = false;
   let refreshAiReviewControlsFn = null;
+  let refreshAiLearningControlsFn = null;
   let experimentalBrowseBlockHeartbeatTimer = null;
   const matchedHandlesInView = new Set(); // accumulates matched handles this scroll session; reset on nav
   const matchedUsersCache = new Map();   // handle → full user object; survives DOM unload by React virtual list
@@ -1236,12 +1238,39 @@
       .filter(item => item.handle || item.displayName || item.reason);
   }
 
+  function loadAiLearningLast() {
+    const raw = GM_getValue(AI_LEARNING_LAST_KEY, null);
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    return {
+      label: ['block', 'hide', 'ignore'].includes(raw?.label) ? raw.label : 'ignore',
+      handle: normalizeHandle(raw?.handle || ''),
+      displayName: String(raw?.displayName || ''),
+      source: String(raw?.source || ''),
+      reason: String(raw?.reason || ''),
+      fingerprint: String(raw?.fingerprint || ''),
+      ts: Number(raw?.ts || 0) || 0,
+    };
+  }
+
   function saveAiLearningExamples(list = aiLearningExamples) {
     const items = (Array.isArray(list) ? list : [])
       .sort((a, b) => Number(b.ts || 0) - Number(a.ts || 0))
       .slice(0, AI_LEARNING_EXAMPLES_MAX);
     aiLearningExamples = items;
     GM_setValue(AI_LEARNING_EXAMPLES_KEY, items);
+  }
+
+  function saveAiLearningLast(entry) {
+    if (!entry) return;
+    GM_setValue(AI_LEARNING_LAST_KEY, {
+      label: String(entry.label || 'ignore'),
+      handle: normalizeHandle(entry.handle || ''),
+      displayName: String(entry.displayName || ''),
+      source: String(entry.source || ''),
+      reason: String(entry.reason || ''),
+      fingerprint: String(entry.fingerprint || ''),
+      ts: Number(entry.ts || Date.now()) || Date.now(),
+    });
   }
 
   function recordAiLearningExample(user, label, meta = {}) {
@@ -1258,7 +1287,9 @@
     aiLearningExamples = aiLearningExamples.filter(item => item.fingerprint !== entry.fingerprint || item.label !== entry.label);
     aiLearningExamples.unshift(entry);
     saveAiLearningExamples();
+    saveAiLearningLast(entry);
     if (typeof refreshAiReviewControlsFn === 'function') refreshAiReviewControlsFn();
+    if (typeof refreshAiLearningControlsFn === 'function') refreshAiLearningControlsFn();
   }
 
   function aiLearningExampleText(limit = 6) {
@@ -6963,6 +6994,60 @@
     aiReviewWrap.appendChild(aiReviewStatus);
     refreshAiReviewControls();
 
+    const aiLearningWrap = document.createElement('div');
+    aiLearningWrap.style.cssText = `border:1px solid ${C.regexKw};background:#f6fbff;border-radius:8px;padding:7px;display:flex;flex-direction:column;gap:6px;`;
+    const aiLearningTitle = document.createElement('div');
+    aiLearningTitle.textContent = 'AI 学习调试';
+    aiLearningTitle.style.cssText = `font-size:11px;font-weight:800;color:${C.regexKw};`;
+    const aiLearningStatus = document.createElement('div');
+    aiLearningStatus.style.cssText = `font-size:10px;line-height:1.35;color:${C.sub};word-break:break-word;`;
+    const aiLearningList = document.createElement('div');
+    aiLearningList.style.cssText = `display:flex;flex-direction:column;gap:4px;max-height:140px;overflow:auto;padding-right:2px;`;
+    const aiLearningRefreshBtn = mkToolBtn('刷新学习样本', () => {
+      refreshAiReviewControls();
+      refreshAiLearningControls();
+      showToast('AI 学习样本已刷新', false);
+    });
+    const aiLearningClearBtn = mkToolBtn('清空学习样本', () => {
+      if (!window.confirm('清空所有 AI 学习样本和最近一次写入记录？')) return;
+      aiLearningExamples = [];
+      GM_setValue(AI_LEARNING_EXAMPLES_KEY, []);
+      GM_setValue(AI_LEARNING_LAST_KEY, null);
+      refreshAiReviewControls();
+      refreshAiLearningControls();
+      showToast('AI 学习样本已清空', false);
+    });
+    function refreshAiLearningControls() {
+      const last = loadAiLearningLast();
+      const rawCount = Array.isArray(GM_getValue(AI_LEARNING_EXAMPLES_KEY, [])) ? GM_getValue(AI_LEARNING_EXAMPLES_KEY, []).length : 0;
+      aiLearningStatus.textContent = last
+        ? `存储 ${aiLearningExamples.length} 条 / 原始 ${rawCount} 条 · 最近一次 ${last.label} @${last.handle || '-'}${last.source ? ` · ${last.source}` : ''}${last.reason ? ` · ${last.reason}` : ''}`
+        : `存储 ${aiLearningExamples.length} 条 / 原始 ${rawCount} 条 · 还没有写入过学习样本`;
+      aiLearningStatus.title = aiLearningStatus.textContent;
+      aiLearningList.textContent = '';
+      const items = aiLearningExamples.slice(0, 8);
+      if (!items.length) {
+        const empty = document.createElement('div');
+        empty.textContent = '暂无学习样本';
+        empty.style.cssText = `font-size:10px;color:${C.sub};padding:4px 0;`;
+        aiLearningList.appendChild(empty);
+        return;
+      }
+      items.forEach(item => {
+        const row = document.createElement('div');
+        row.style.cssText = `padding:4px 6px;border:1px solid ${C.border};border-radius:6px;background:#fff;font-size:10px;line-height:1.35;word-break:break-word;`;
+        row.textContent = `${item.label} · @${item.handle || '-'}${item.displayName ? ` (${item.displayName})` : ''}${item.source ? ` · ${item.source}` : ''}${item.reason ? ` · ${item.reason}` : ''}`;
+        aiLearningList.appendChild(row);
+      });
+    }
+    refreshAiLearningControlsFn = refreshAiLearningControls;
+    aiLearningWrap.appendChild(aiLearningTitle);
+    aiLearningWrap.appendChild(aiLearningRefreshBtn);
+    aiLearningWrap.appendChild(aiLearningClearBtn);
+    aiLearningWrap.appendChild(aiLearningStatus);
+    aiLearningWrap.appendChild(aiLearningList);
+    refreshAiLearningControls();
+
     function refreshRemoteRulesControls() {
       remoteRulesBtn.textContent = `远程规则订阅：${remoteRulesActive ? '开' : '关'}`;
       remoteRulesBtn.style.borderColor = remoteRulesActive ? C.nameKw : C.btnBorder;
@@ -7168,6 +7253,7 @@
     grid.appendChild(verifiedProtectBtn);
     grid.appendChild(hideOnlyRulesBtn);
     grid.appendChild(aiReviewWrap);
+    grid.appendChild(aiLearningWrap);
     grid.appendChild(remoteWrap);
     grid.appendChild(youngWrap);
     grid.appendChild(mkToolBtn('两类账号说明', showCategoryHelp));
