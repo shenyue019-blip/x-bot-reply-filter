@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         垃圾推号大扫除 - 自用版
 // @namespace    http://tampermonkey.net/
-// @version      6.18.0
+// @version      6.18.2
 // @description  扫描推文回复中的垃圾用户批量拉黑
 // @author       summeriscoming
 // @license MIT
@@ -3289,6 +3289,17 @@
           item.attempts ? `尝试 ${item.attempts}` : '',
           item.error ? `错误 ${item.error}` : '',
         ].filter(Boolean).join(' · ');
+        const ruleSummary = queueMatchSummaryText({
+          cats: new Set(normalizeQueuePreviewCats(item.previewCats)),
+          heartHits: Array.isArray(item.heartHits) ? item.heartHits : [],
+          nameKwHits: Array.isArray(item.nameKwHits) ? item.nameKwHits : [],
+          kwHits: normalizeQueueKeywordHits(item.kwHits),
+          reHits: normalizeQueueRegexHits(item.reHits),
+          hideOnlyReHits: normalizeQueueRegexHits(item.hideOnlyReHits),
+        });
+        const aiSummary = item.aiDecision
+          ? `AI ${item.aiDecision}${item.aiConfidence ? ` ${Math.round(Number(item.aiConfidence) * 100)}%` : ''}${item.aiReason ? ` · ${item.aiReason}` : ''}`
+          : 'AI 未参与';
         const previewCats = normalizeQueuePreviewCats(item.previewCats);
         return {
           handle: normalizeHandle(item.handle),
@@ -3304,6 +3315,8 @@
           queueStatus: status,
           queueStatusLabel: label,
           queueStatusDetail: detail || `加入时间 ${new Date(Number(item.addedAt || Date.now())).toLocaleTimeString()}`,
+          queueRuleSummary: ruleSummary,
+          queueAiSummary: aiSummary,
           queueUpdatedAt: Number(item.updatedAt || 0),
         };
       })
@@ -3323,6 +3336,17 @@
           queueStatus: 'done',
           queueStatusLabel: '历史已屏蔽',
           queueStatusDetail: `屏蔽时间 ${new Date(Number(item.blockedAt || item.updatedAt || Date.now())).toLocaleString()}`,
+          queueRuleSummary: queueMatchSummaryText({
+            cats: new Set(normalizeQueuePreviewCats(item.previewCats)),
+            heartHits: Array.isArray(item.heartHits) ? item.heartHits : [],
+            nameKwHits: Array.isArray(item.nameKwHits) ? item.nameKwHits : [],
+            kwHits: normalizeQueueKeywordHits(item.kwHits),
+            reHits: normalizeQueueRegexHits(item.reHits),
+            hideOnlyReHits: normalizeQueueRegexHits(item.hideOnlyReHits),
+          }),
+          queueAiSummary: item.aiDecision
+            ? `AI ${item.aiDecision}${item.aiConfidence ? ` ${Math.round(Number(item.aiConfidence) * 100)}%` : ''}${item.aiReason ? ` · ${item.aiReason}` : ''}`
+            : 'AI 未参与',
           queueUpdatedAt: Number(item.blockedAt || item.updatedAt || 0),
         }))
         : []);
@@ -3700,6 +3724,17 @@
           fresh.items[key] = { ...fresh.items[key], status: 'done', updatedAt: Date.now(), blockedAt: Date.now(), error: '' };
           archiveGlobalBlockedItem(fresh.items[key]);
           writeGlobalBlockQueue(fresh);
+          if (['manual', 'panel', 'inline'].includes(String(next.source || ''))) {
+            recordAiLearningExample({
+              handle: next.handle,
+              displayName: next.displayName || '',
+              source: next.source || 'manual',
+            }, 'block', {
+              source: next.source || 'manual',
+              reason: next.reason || 'manual block',
+              fingerprint: aiReviewFingerprint(next),
+            });
+          }
           incrementPersistentBlockedCount(1);
           markHandleBlockedFromQueue(next.handle);
           const nextRoundCount = readGlobalQueueRound().count + 1;
@@ -4839,12 +4874,19 @@
         html += `<div style="color:${C.sub};font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"><a class="xfs-profile-link" href="${profileUrl}" target="_blank" rel="noopener noreferrer" title="${esc(profileTitle)}" style="color:inherit;text-decoration:none;">@${esc(user.handle)}</a></div>`;
         if (isGlobalQueueView) {
           html += `<div style="font-size:9px;color:${color};font-weight:700;">[${esc(user.queueStatusLabel || user.queueStatus || 'queued')}] ${esc(user.queueStatusDetail || '')}</div>`;
+          html += `
+            <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px;margin-top:1px;">
+              <div style="min-width:0;padding:2px 4px;border:1px solid ${C.border};border-radius:6px;background:rgba(255,255,255,0.78);font-size:9px;line-height:1.25;color:${C.text};word-break:break-word;">
+                <div style="font-weight:800;color:${C.sub};margin-bottom:1px;">规则</div>
+                <div>${esc(user.queueRuleSummary || '无规则命中')}</div>
+              </div>
+              <div style="min-width:0;padding:2px 4px;border:1px solid ${C.border};border-radius:6px;background:rgba(255,255,255,0.78);font-size:9px;line-height:1.25;color:${C.text};word-break:break-word;">
+                <div style="font-weight:800;color:${C.sub};margin-bottom:1px;">AI</div>
+                <div>${esc(user.queueAiSummary || 'AI 未参与')}</div>
+              </div>
+            </div>`;
           if (user.tweetSnippet) {
             html += `<div style="font-size:9px;color:${C.sub};font-style:italic;word-break:break-all;">"${esc(user.tweetSnippet)}"</div>`;
-          }
-          const queueMatchSummary = queueMatchSummaryText(user);
-          if (queueMatchSummary) {
-            html += `<div style="font-size:9px;color:${C.sub};word-break:break-all;">${esc(queueMatchSummary)}</div>`;
           }
         }
         if (!isGlobalQueueView && user.cats.has('heart') && user.heartHits && user.heartHits.length > 0) {
