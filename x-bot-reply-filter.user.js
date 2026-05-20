@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X Bot Reply Filter
 // @namespace    local.x.bot.reply.filter
-// @version      0.2.3
+// @version      0.2.4
 // @description  Hide likely bot/spam replies on X with conservative local scoring and local block/mute logs.
 // @match        https://x.com/*
 // @match        https://twitter.com/*
@@ -1271,11 +1271,11 @@
       state.panel.innerHTML = `
         <button type="button" class="xbrf-tool-main" data-action="collapse" title="收起/展开工具栏">XBF</button>
         <div class="xbrf-tool-stack">
-          <button type="button" data-action="toggle" title="开启/关闭隐藏"></button>
-          <button type="button" data-action="reveal" title="临时显示被隐藏回复">显</button>
-          <button type="button" data-action="queue" title="拉黑队列">队</button>
-          <button type="button" data-action="rules" title="关键词和正则">规</button>
-          <button type="button" data-action="logs" title="日志">志</button>
+          <button type="button" data-action="toggle" title="开启/关闭自动隐藏"></button>
+          <button type="button" data-action="reveal" title="临时显示被隐藏回复">显示</button>
+          <button type="button" data-action="queue" title="拉黑队列">队列</button>
+          <button type="button" data-action="rules" title="关键词和正则">规则</button>
+          <button type="button" data-action="logs" title="日志">日志</button>
         </div>
         <span data-role="count" class="xbrf-count"></span>
       `;
@@ -1292,10 +1292,10 @@
           flex-direction: column;
           align-items: center;
           gap: 7px;
-          width: 44px;
-          padding: 7px 5px;
-          border: 1.5px solid rgba(207,217,222,.92);
-          border-radius: 24px;
+          width: 58px;
+          padding: 7px 6px;
+          border: 1.5px solid rgba(207,217,222,.95);
+          border-radius: 20px;
           background: rgba(255,255,255,.84);
           color: #0f1419;
           font: 12px/1.2 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -1309,7 +1309,7 @@
           display: none;
         }
         #x-bot-reply-filter-panel button {
-          width: 34px;
+          width: 46px;
           height: 34px;
           border: 1px solid #cfd9de;
           border-radius: 999px;
@@ -1327,6 +1327,7 @@
           box-shadow: 0 3px 12px rgba(15,20,25,.18);
         }
         #x-bot-reply-filter-panel .xbrf-tool-main {
+          width: 46px;
           color: #fff;
           background: #1d9bf0;
           border-color: #1d9bf0;
@@ -1339,7 +1340,7 @@
           align-items: center;
         }
         #x-bot-reply-filter-panel .xbrf-count {
-          min-width: 18px;
+          min-width: 20px;
           height: 18px;
           padding: 0 5px;
           border-radius: 9px;
@@ -1349,6 +1350,26 @@
           font-weight: 800;
           line-height: 18px;
           text-align: center;
+        }
+        #x-bot-reply-filter-panel button.xbrf-enabled {
+          color: #fff;
+          background: #1d9bf0;
+          border-color: #1d9bf0;
+        }
+        #x-bot-reply-filter-panel button.xbrf-disabled {
+          color: #536471;
+          background: #eff3f4;
+          border-color: #cfd9de;
+        }
+        #x-bot-reply-filter-panel button.xbrf-running {
+          color: #fff;
+          background: #f4212e;
+          border-color: #f4212e;
+        }
+        #x-bot-reply-filter-panel button.xbrf-has-items {
+          color: #fff;
+          background: #ff7a00;
+          border-color: #ff7a00;
         }
         #x-bot-reply-filter-log-panel,
         #x-bot-reply-filter-queue-panel,
@@ -1658,10 +1679,25 @@
     }
 
     const toggle = state.panel.querySelector('[data-action="toggle"]');
+    const queueButton = state.panel.querySelector('[data-action="queue"]');
     const count = state.panel.querySelector('[data-role="count"]');
-    toggle.textContent = config.enabled ? "隐" : "停";
-    toggle.title = config.enabled ? "过滤已开启" : "过滤已暂停";
+    const pendingCount = loadQueue().filter((item) => item.status === "pending").length;
+
+    toggle.textContent = config.enabled ? "隐藏开" : "隐藏停";
+    toggle.title = config.enabled ? "自动隐藏已开启，点击暂停" : "自动隐藏已暂停，点击开启";
+    toggle.classList.toggle("xbrf-enabled", config.enabled);
+    toggle.classList.toggle("xbrf-disabled", !config.enabled);
+
+    queueButton.classList.toggle("xbrf-running", state.autoBlockRunning);
+    queueButton.classList.toggle("xbrf-has-items", !state.autoBlockRunning && pendingCount > 0);
+    queueButton.title = state.autoBlockRunning
+      ? `自动拉黑运行中，本轮已处理 ${state.autoBlockProcessed}`
+      : pendingCount > 0
+        ? `拉黑队列：${pendingCount} 个待处理`
+        : "拉黑队列";
+
     count.textContent = `${state.hiddenCount}`;
+    count.style.display = state.hiddenCount > 0 ? "" : "none";
   }
 
   function rememberMenuArticle(event) {
