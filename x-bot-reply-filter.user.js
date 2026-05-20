@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         垃圾推号大扫除 - 自用版
 // @namespace    http://tampermonkey.net/
-// @version      6.18.14
+// @version      6.18.15
 // @description  扫描推文回复中的垃圾用户批量拉黑
 // @author       summeriscoming
 // @license MIT
@@ -644,6 +644,7 @@
   let globalQueueUiTimer = null;
   let globalQueuePanelDragging = false;
   let globalQueuePanelSuppressed = false;
+  let globalQueueWorkerEpoch = 0;
   let refreshAiReviewControlsFn = null;
   let refreshAiWorkLogPanelFn = null;
   let refreshAiLearningPanelFn = null;
@@ -3370,6 +3371,7 @@
         },
         data: `screen_name=${encodeURIComponent(handle)}`,
         anonymous: false,
+        timeout: 60000,
         onload(resp) {
           if (resp.status >= 200 && resp.status < 300) {
             console.log(`[XFS] OK @${handle} =>`, resp.responseText.slice(0, 120));
@@ -3382,6 +3384,10 @@
         onerror(e) {
           console.error(`[XFS] ERROR @${handle}:`, e);
           reject(new Error('网络请求失败'));
+        },
+        ontimeout() {
+          console.error(`[XFS] TIMEOUT @${handle}`);
+          reject(new Error('请求超时'));
         },
       });
     });
@@ -3612,6 +3618,24 @@
     writeGlobalBlockHistory(history);
   }
 
+  function markGlobalBlockHistoryUnblocked(handle, meta = {}) {
+    const key = normalizeHandle(handle);
+    if (!key) return false;
+    const history = readGlobalBlockHistory();
+    const prev = history.items[key];
+    history.items[key] = {
+      ...prev,
+      handle: key,
+      displayName: String(meta.displayName || prev?.displayName || key),
+      status: 'skipped',
+      reason: String(meta.reason || prev?.reason || '用户取消拉黑'),
+      unblockedAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+    writeGlobalBlockHistory(history);
+    return true;
+  }
+
   function globalBlockHistoryItems() {
     return Object.values(readGlobalBlockHistory().items || {})
       .filter(item => item && normalizeHandle(item.handle))
@@ -3714,33 +3738,38 @@
       })
       .concat(showDone ? globalBlockHistoryItems()
         .filter(item => !q.items?.[normalizeHandle(item.handle)])
-        .map(item => ({
-          handle: normalizeHandle(item.handle),
-          displayName: item.displayName || item.handle,
-          cats: new Set(normalizeQueuePreviewCats(item.previewCats)),
-          queueRowCat: 'liker',
-          heartHits: Array.isArray(item.heartHits) ? item.heartHits.map(v => String(v || '')).filter(Boolean).slice(0, 6) : [],
-          nameKwHits: Array.isArray(item.nameKwHits) ? item.nameKwHits.map(v => String(v || '')).filter(Boolean).slice(0, 6) : [],
-          kwHits: normalizeQueueKeywordHits(item.kwHits),
-          reHits: normalizeQueueRegexHits(item.reHits),
-          hideOnlyReHits: normalizeQueueRegexHits(item.hideOnlyReHits),
-          tweetSnippet: String(item.tweetSnippet || item.reason || ''),
-          queueStatus: 'done',
-          queueStatusLabel: '历史已屏蔽',
-          queueStatusDetail: `屏蔽时间 ${new Date(Number(item.blockedAt || item.updatedAt || Date.now())).toLocaleString()}`,
-          queueRuleSummary: queueMatchSummaryText({
+        .map(item => {
+          const unblocked = !!item.unblockedAt || item.status === 'skipped';
+          return {
+            handle: normalizeHandle(item.handle),
+            displayName: item.displayName || item.handle,
             cats: new Set(normalizeQueuePreviewCats(item.previewCats)),
-            heartHits: Array.isArray(item.heartHits) ? item.heartHits : [],
-            nameKwHits: Array.isArray(item.nameKwHits) ? item.nameKwHits : [],
+            queueRowCat: unblocked ? 'suspect' : 'liker',
+            heartHits: Array.isArray(item.heartHits) ? item.heartHits.map(v => String(v || '')).filter(Boolean).slice(0, 6) : [],
+            nameKwHits: Array.isArray(item.nameKwHits) ? item.nameKwHits.map(v => String(v || '')).filter(Boolean).slice(0, 6) : [],
             kwHits: normalizeQueueKeywordHits(item.kwHits),
             reHits: normalizeQueueRegexHits(item.reHits),
             hideOnlyReHits: normalizeQueueRegexHits(item.hideOnlyReHits),
-          }),
-          queueAiSummary: item.aiDecision
-            ? `AI 判断：${aiReviewActionLabel(item.aiDecision)}${item.aiConfidence ? ` ${Math.round(Number(item.aiConfidence) * 100)}%` : ''}${item.aiReason ? ` · ${item.aiReason}` : ''}`
-            : 'AI 未参与',
-          queueUpdatedAt: Number(item.blockedAt || item.updatedAt || 0),
-        }))
+            tweetSnippet: String(item.tweetSnippet || item.reason || ''),
+            queueStatus: unblocked ? 'skipped' : 'done',
+            queueStatusLabel: unblocked ? '历史已放行' : '历史已屏蔽',
+            queueStatusDetail: unblocked
+              ? `放行时间 ${new Date(Number(item.unblockedAt || item.updatedAt || Date.now())).toLocaleString()}`
+              : `屏蔽时间 ${new Date(Number(item.blockedAt || item.updatedAt || Date.now())).toLocaleString()}`,
+            queueRuleSummary: queueMatchSummaryText({
+              cats: new Set(normalizeQueuePreviewCats(item.previewCats)),
+              heartHits: Array.isArray(item.heartHits) ? item.heartHits : [],
+              nameKwHits: Array.isArray(item.nameKwHits) ? item.nameKwHits : [],
+              kwHits: normalizeQueueKeywordHits(item.kwHits),
+              reHits: normalizeQueueRegexHits(item.reHits),
+              hideOnlyReHits: normalizeQueueRegexHits(item.hideOnlyReHits),
+            }),
+            queueAiSummary: item.aiDecision
+              ? `AI 判断：${aiReviewActionLabel(item.aiDecision)}${item.aiConfidence ? ` ${Math.round(Number(item.aiConfidence) * 100)}%` : ''}${item.aiReason ? ` · ${item.aiReason}` : ''}`
+              : 'AI 未参与',
+            queueUpdatedAt: Number(item.unblockedAt || item.blockedAt || item.updatedAt || 0),
+          };
+        })
         : []);
   }
 
@@ -4017,6 +4046,7 @@
     writeGlobalBlockQueue(q);
     updateGlobalBlockQueuePanel();
     refreshGlobalBlockQueueDetailPanel();
+    refreshGlobalQueueInlineButtons();
     return { ok: true, status: item.status || 'queued' };
   }
 
@@ -4038,6 +4068,40 @@
     refreshGlobalBlockQueueDetailPanel(q);
     refreshGlobalQueueInlineButtons();
     maybeStartGlobalBlockQueueWorker();
+    return { ok: true };
+  }
+
+  async function unblockAndExemptQueueUser(user) {
+    const handle = normalizeHandle(user?.handle || user);
+    if (!handle) return { ok: false, reason: 'invalid' };
+    const csrf = getCsrf();
+    if (!csrf) {
+      showToast('未找到登录凭证，请刷新 X 页面或重新登录后再试', true);
+      return { ok: false, reason: 'auth' };
+    }
+    await unblockUser(handle, csrf);
+    const displayName = String(user?.displayName || handle);
+    const reason = '用户在拉黑排队卡片中取消拉黑';
+    const q = readGlobalBlockQueue();
+    if (q.items[handle]) {
+      q.items[handle] = {
+        ...q.items[handle],
+        status: 'skipped',
+        error: reason,
+        updatedAt: Date.now(),
+        unblockedAt: Date.now(),
+      };
+      writeGlobalBlockQueue(q);
+    }
+    markGlobalBlockHistoryUnblocked(handle, { displayName, reason });
+    blockedHandles.delete(handle);
+    purgeAiMemoryForHandle(handle);
+    rememberAiExemptHandle({ handle, displayName }, { source: 'manual_unblock', reason });
+    recordAiLearningExample({ handle, displayName, source: 'manual_unblock' }, 'ignore', { reason });
+    clearVisibleStateForAiExemptHandle(handle);
+    updateGlobalBlockQueuePanel();
+    refreshGlobalBlockQueueDetailPanel();
+    refreshGlobalQueueInlineButtons();
     return { ok: true };
   }
 
@@ -4125,6 +4189,11 @@
     const lastBlockAt = parseInt(localStorage.getItem(LS_LAST_BLOCK) || '0', 10);
     const lastBlockCleared = force && Number.isFinite(lastBlockAt) && lastBlockAt > Date.now() + 5 * 60 * 1000;
     if (lastBlockCleared) localStorage.removeItem(LS_LAST_BLOCK);
+    if (force) {
+      globalQueueWorkerEpoch += 1;
+      globalQueueWorkerActive = false;
+      releaseGlobalBlockQueueLock();
+    }
     if (force && globalBlockQueuePaused()) setGlobalBlockQueuePaused(false, { keepRound: true });
     updateGlobalBlockQueuePanel();
     refreshGlobalBlockQueueDetailPanel(q);
@@ -4180,8 +4249,10 @@
     if (globalQueueWorkerActive || globalBlockQueuePaused()) return;
     if (!tryAcquireGlobalBlockQueueLock()) return;
     globalQueueWorkerActive = true;
+    const workerEpoch = ++globalQueueWorkerEpoch;
     try {
       while (!globalBlockQueuePaused()) {
+        if (workerEpoch !== globalQueueWorkerEpoch) break;
         if (!heartbeatGlobalBlockQueueLock()) break;
         const round = readGlobalQueueRound();
         if (Number(round.cooldownUntil || 0) > Date.now()) {
@@ -4214,6 +4285,7 @@
           await blockUserCoordinated(next.handle, csrf, null, {
             slow: experimentalBrowseBlockActive() || next.source === 'browse_auto',
           });
+          if (workerEpoch !== globalQueueWorkerEpoch) break;
           const fresh = readGlobalBlockQueue();
           fresh.items[key] = { ...fresh.items[key], status: 'done', updatedAt: Date.now(), blockedAt: Date.now(), error: '' };
           archiveGlobalBlockedItem(fresh.items[key]);
@@ -4240,6 +4312,7 @@
             if (globalBlockQueuePaused()) break;
           }
         } catch (e) {
+          if (workerEpoch !== globalQueueWorkerEpoch) break;
           if (isBlockAuthLostError(e)) {
             pauseGlobalQueueForAuthLoss(e?.message || '登录状态失效');
             console.warn(`[XFS] global queue paused due to auth loss @${next.handle}:`, e);
@@ -4260,8 +4333,10 @@
         updateGlobalBlockQueuePanel();
       }
     } finally {
-      globalQueueWorkerActive = false;
-      releaseGlobalBlockQueueLock();
+      if (workerEpoch === globalQueueWorkerEpoch) {
+        globalQueueWorkerActive = false;
+        releaseGlobalBlockQueueLock();
+      }
       updateGlobalBlockQueuePanel();
     }
   }
@@ -4290,11 +4365,13 @@
         },
         data: `screen_name=${encodeURIComponent(handle)}`,
         anonymous: false,
+        timeout: 60000,
         onload(resp) {
           if (resp.status >= 200 && resp.status < 300) resolve();
           else reject(new Error(`HTTP ${resp.status}`));
         },
         onerror() { reject(new Error('网络请求失败')); },
+        ontimeout() { reject(new Error('请求超时')); },
       });
     });
   }
@@ -5484,13 +5561,37 @@
           const removeBtn = document.createElement('button');
           removeBtn.type = 'button';
           removeBtn.textContent = '×';
-          removeBtn.title = running ? `@${user.handle} 正在执行中，暂时不能移出队列` : `将 @${user.handle} 移出拉黑队列`;
-          removeBtn.disabled = running;
-          removeBtn.style.cssText = `position:absolute;top:4px;right:5px;z-index:1;width:14px;height:14px;padding:0;border:none;border-radius:999px;background:${running ? 'transparent' : 'rgba(15,20,25,0.06)'};color:${running ? C.mute : C.sub};font-size:12px;line-height:1;display:flex;align-items:center;justify-content:center;cursor:${running ? 'not-allowed' : 'pointer'};opacity:${running ? '0.45' : '1'};`;
-          removeBtn.onclick = e => {
+          const doneLike = (user.queueStatus || '') === 'done';
+          removeBtn.title = doneLike
+            ? `取消拉黑 @${user.handle}，并加入放行名单`
+            : (running ? `@${user.handle} 正在执行中；点“恢复执行”可先重置卡住状态` : `将 @${user.handle} 移出拉黑队列`);
+          removeBtn.disabled = false;
+          removeBtn.style.cssText = `position:absolute;top:4px;right:5px;z-index:12;width:16px;height:16px;padding:0;border:none;border-radius:999px;background:rgba(15,20,25,0.07);color:${doneLike ? C.blockRed : C.sub};font-size:13px;line-height:1;display:flex;align-items:center;justify-content:center;cursor:pointer;opacity:1;`;
+          removeBtn.onclick = async e => {
             e.stopPropagation();
-            const result = removeGlobalBlockQueueItem(user.handle);
-            if (!result.ok && result.reason === 'running') showToast(`@${user.handle} 正在执行中，暂时不能移出队列`, true);
+            e.preventDefault();
+            if (removeBtn.disabled) return;
+            removeBtn.disabled = true;
+            try {
+              if (doneLike) {
+                await unblockAndExemptQueueUser(user);
+                showToast(`@${user.handle} 已取消拉黑，并加入放行名单`, false);
+              } else {
+                const result = removeGlobalBlockQueueItem(user.handle);
+                if (result.ok) {
+                  wrap.remove();
+                  showToast(`@${user.handle} 已移出拉黑队列`, false);
+                } else if (result.reason === 'running') {
+                  showToast(`@${user.handle} 正在执行中；如已卡住，请点“恢复执行”后再移出`, true);
+                } else {
+                  showToast(`没有找到 @${user.handle} 的队列项`, true);
+                }
+              }
+            } catch (err) {
+              showToast(`取消 @${user.handle} 失败：${err?.message || err}`, true);
+            } finally {
+              removeBtn.disabled = false;
+            }
           };
           wrap.appendChild(retryBtn);
           wrap.appendChild(removeBtn);
