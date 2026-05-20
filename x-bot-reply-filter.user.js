@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X Bot Reply Filter
 // @namespace    local.x.bot.reply.filter
-// @version      0.2.4
+// @version      0.2.5
 // @description  Hide likely bot/spam replies on X with conservative local scoring and local block/mute logs.
 // @match        https://x.com/*
 // @match        https://twitter.com/*
@@ -59,7 +59,7 @@
   const defaultCustomRules = {
     schemaVersion: 1,
     contentKeywords: ["主页领取", "进群", "看主页", "私信我", "加我", "稳赚", "带单", "裸聊", "约炮"],
-    nameKeywords: ["福利", "带单", "稳赚", "同城", "裸聊", "外围"],
+    nameKeywords: ["福利", "带单", "稳赚", "同城", "裸聊", "外围", "固炮"],
     regexKeywords: [
       "content:/^[\\\\p{Extended_Pictographic}\\\\s\\\\p{P}]{8,}$/u",
       "name:/^[a-z]{4,10}\\\\d{5,}$/i",
@@ -124,7 +124,7 @@
   ];
 
   const riskyNamePatterns = [
-    /约炮|外围|全套|包夜|私约|裸聊|调教|福利|白给|同城/i,
+    /固炮|约炮|外围|全套|包夜|私约|裸聊|调教|福利|白给|同城/i,
     /空投|带单|跟单|稳赚|返利|量化|合约|币圈|打新/i,
   ];
 
@@ -276,12 +276,16 @@
 
   function loadRules() {
     const saved = loadJson(RULES_KEY, {});
-    return {
+    const rules = {
       schemaVersion: 1,
       contentKeywords: Array.isArray(saved.contentKeywords) ? saved.contentKeywords : defaultCustomRules.contentKeywords,
       nameKeywords: Array.isArray(saved.nameKeywords) ? saved.nameKeywords : defaultCustomRules.nameKeywords,
       regexKeywords: Array.isArray(saved.regexKeywords) ? saved.regexKeywords : defaultCustomRules.regexKeywords,
     };
+    for (const keyword of defaultCustomRules.nameKeywords) {
+      if (!rules.nameKeywords.includes(keyword)) rules.nameKeywords.push(keyword);
+    }
+    return rules;
   }
 
   function saveRules(rules) {
@@ -424,9 +428,9 @@
     for (const keyword of normalizeRuleList(customRules.nameKeywords)) {
       const re = new RegExp(escapeRegExp(keyword), "i");
       if (re.test(nameText)) {
-        score += 4;
+        score += 8;
         ruleHits.push(`name:${keyword}`);
-        pushReason(reasons, "custom name keyword", 4);
+        pushReason(reasons, "custom name keyword", 8);
       }
     }
 
