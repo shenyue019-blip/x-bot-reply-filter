@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         垃圾推号大扫除 - 自用版
 // @namespace    http://tampermonkey.net/
-// @version      6.17.9
+// @version      6.18.0
 // @description  扫描推文回复中的垃圾用户批量拉黑
 // @author       summeriscoming
 // @license MIT
@@ -574,6 +574,21 @@
   const REFERRAL_RATE_LIMIT_COOLDOWN = 10 * 60 * 1000;
   const REFERRAL_FAILURE_TTL = 30 * 60 * 1000;
   const REFERRAL_MAX_CACHE = 1200;
+  const AI_REVIEW_ENABLED_KEY = 'xfs-ai-review-enabled-v1';
+  const AI_REVIEW_MODEL_KEY = 'xfs-ai-review-model-v1';
+  const AI_REVIEW_API_KEY_KEY = 'xfs-ai-review-api-key-v1';
+  const AI_REVIEW_CACHE_KEY = 'xfs-ai-review-cache-v1';
+  const AI_REVIEW_CACHE_TTL = 7 * 24 * 60 * 60 * 1000;
+  const AI_REVIEW_CACHE_MAX = 800;
+  const AI_HIDDEN_HANDLES_KEY = 'xfs-ai-hidden-handles-v1';
+  const AI_HIDDEN_HANDLES_TTL = 30 * 24 * 60 * 60 * 1000;
+  const AI_HIDDEN_HANDLES_MAX = 1200;
+  const AI_EXEMPT_HANDLES_KEY = 'xfs-ai-exempt-handles-v1';
+  const AI_EXEMPT_HANDLES_MAX = 2000;
+  const AI_LEARNING_EXAMPLES_KEY = 'xfs-ai-learning-examples-v1';
+  const AI_LEARNING_EXAMPLES_MAX = 300;
+  const AI_AUTO_RULES_KEY = 'xfs-ai-auto-rules-v1';
+  const AI_REVIEW_DEFAULT_MODEL = 'gpt-5.5';
   const DAY_MS = 24 * 60 * 60 * 1000;
   const EXPERIMENT_TIMING_DEFAULTS = Object.freeze({
     slowBlockingMode: false,
@@ -607,6 +622,8 @@
   let youngAccountCutoffMode = normalizeYoungAccountCutoffMode(GM_getValue('young_account_cutoff_mode', 'days'));
   let youngAccountMaxAgeDays = normalizeYoungAccountDays(GM_getValue('young_account_max_age_days', 30));
   let youngAccountCutoffDate = normalizeDateInputValue(GM_getValue('young_account_cutoff_date', defaultYoungAccountCutoffDate()));
+  let aiReviewActive = GM_getValue(AI_REVIEW_ENABLED_KEY, false); // optional AI review for non-name suspicious accounts
+  let aiAutoRulesActive = GM_getValue(AI_AUTO_RULES_KEY, false); // optional: auto-apply AI rule suggestions
   let panelDockedActive = GM_getValue('panel_docked', false); // remember whether the result panel should open docked
   let buttonsCollapsed = GM_getValue('buttons_collapsed', false); // collapse the right-side floating tool stack
   let toolbarRight = GM_getValue('toolbar_right', 18);
@@ -993,6 +1010,564 @@
   }
 
   let referralSaveTimer = null;
+
+  function stableStringHash(input) {
+    const str = String(input || '');
+    let hash = 0x811c9dc5;
+    for (let i = 0; i < str.length; i += 1) {
+      hash ^= str.charCodeAt(i);
+      hash = Math.imul(hash, 0x01000193);
+    }
+    return (hash >>> 0).toString(36);
+  }
+
+  function normalizeAiReviewModel(value) {
+    const raw = String(value || '').trim();
+    return raw || AI_REVIEW_DEFAULT_MODEL;
+  }
+
+  function aiReviewApiKey() {
+    return String(GM_getValue(AI_REVIEW_API_KEY_KEY, '') || '').trim();
+  }
+
+  function aiReviewModel() {
+    return normalizeAiReviewModel(GM_getValue(AI_REVIEW_MODEL_KEY, AI_REVIEW_DEFAULT_MODEL));
+  }
+
+  function aiReviewConfigured() {
+    return !!(aiReviewActive && aiReviewApiKey());
+  }
+
+  function loadAiReviewCache() {
+    const raw = GM_getValue(AI_REVIEW_CACHE_KEY, {});
+    const now = Date.now();
+    const cache = new Map();
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return cache;
+    Object.entries(raw).forEach(([key, item]) => {
+      const ts = Number(item && item.ts);
+      if (!Number.isFinite(ts) || now - ts > AI_REVIEW_CACHE_TTL) return;
+      cache.set(key, {
+        action: String(item?.action || ''),
+        confidence: Math.max(0, Math.min(1, Number(item?.confidence) || 0)),
+        reason: String(item?.reason || ''),
+        ruleSuggestion: item?.ruleSuggestion && typeof item.ruleSuggestion === 'object' ? {
+          scope: String(item.ruleSuggestion.scope || ''),
+          value: String(item.ruleSuggestion.value || ''),
+          note: String(item.ruleSuggestion.note || ''),
+          confidence: Math.max(0, Math.min(1, Number(item.ruleSuggestion.confidence) || 0)),
+        } : null,
+        handle: normalizeHandle(item?.handle || ''),
+        displayName: String(item?.displayName || ''),
+        source: String(item?.source || ''),
+        ts,
+      });
+    });
+    return cache;
+  }
+
+  function saveAiReviewCache(cache = aiReviewCache) {
+    const entries = [...cache.entries()]
+      .sort((a, b) => Number(b[1]?.ts || 0) - Number(a[1]?.ts || 0))
+      .slice(0, AI_REVIEW_CACHE_MAX);
+    cache.clear();
+    const out = {};
+    entries.forEach(([key, item]) => {
+      cache.set(key, item);
+      out[key] = item;
+    });
+    GM_setValue(AI_REVIEW_CACHE_KEY, out);
+  }
+
+  function aiReviewFingerprint(user) {
+    const handle = normalizeHandle(user?.handle || '');
+    const displayName = String(user?.displayName || '');
+    const tweetSnippet = String(user?.tweetSnippet || '');
+    const cats = normalizeQueuePreviewCats(user?.cats).join(',');
+    const heartHits = Array.isArray(user?.heartHits) ? user.heartHits.join('|') : '';
+    const nameKwHits = Array.isArray(user?.nameKwHits) ? user.nameKwHits.join('|') : '';
+    const kwHits = Array.isArray(user?.kwHits) ? user.kwHits.map(hit => `${hit?.kw || ''}:${hit?.snippet || ''}`).join('|') : '';
+    const reHits = Array.isArray(user?.reHits) ? user.reHits.map(hit => `${hit?.pat || ''}:${hit?.snippet || ''}`).join('|') : '';
+    return stableStringHash([handle, displayName, tweetSnippet, cats, heartHits, nameKwHits, kwHits, reHits].join('\u001f'));
+  }
+
+  function loadAiHiddenHandles() {
+    const raw = GM_getValue(AI_HIDDEN_HANDLES_KEY, {});
+    const now = Date.now();
+    const cache = new Map();
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return cache;
+    Object.entries(raw).forEach(([key, item]) => {
+      const ts = Number(item && item.ts);
+      if (!Number.isFinite(ts) || now - ts > AI_HIDDEN_HANDLES_TTL) return;
+      const handle = normalizeHandle(item?.handle || key);
+      if (!handle) return;
+      cache.set(handle, {
+        handle,
+        reason: String(item?.reason || ''),
+        confidence: Math.max(0, Math.min(1, Number(item?.confidence) || 0)),
+        source: String(item?.source || ''),
+        ts,
+      });
+    });
+    return cache;
+  }
+
+  function saveAiHiddenHandles(cache = aiHiddenHandles) {
+    const entries = [...cache.entries()]
+      .sort((a, b) => Number(b[1]?.ts || 0) - Number(a[1]?.ts || 0))
+      .slice(0, AI_HIDDEN_HANDLES_MAX);
+    cache.clear();
+    const out = {};
+    entries.forEach(([key, item]) => {
+      cache.set(key, item);
+      out[key] = item;
+    });
+    GM_setValue(AI_HIDDEN_HANDLES_KEY, out);
+  }
+
+  function loadAiExemptHandles() {
+    const raw = GM_getValue(AI_EXEMPT_HANDLES_KEY, {});
+    const cache = new Map();
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return cache;
+    Object.entries(raw).forEach(([key, item]) => {
+      const handle = normalizeHandle(item?.handle || key);
+      if (!handle) return;
+      cache.set(handle, {
+        handle,
+        reason: String(item?.reason || ''),
+        source: String(item?.source || ''),
+        ts: Number(item?.ts || 0) || Date.now(),
+      });
+    });
+    return cache;
+  }
+
+  function saveAiExemptHandles(cache = aiExemptHandles) {
+    const entries = [...cache.entries()]
+      .sort((a, b) => Number(b[1]?.ts || 0) - Number(a[1]?.ts || 0))
+      .slice(0, AI_EXEMPT_HANDLES_MAX);
+    cache.clear();
+    const out = {};
+    entries.forEach(([key, item]) => {
+      cache.set(key, item);
+      out[key] = item;
+    });
+    GM_setValue(AI_EXEMPT_HANDLES_KEY, out);
+  }
+
+  function rememberAiExemptHandle(user, meta = {}) {
+    const handle = normalizeHandle(user?.handle || user);
+    if (!handle) return;
+    aiExemptHandles.set(handle, {
+      handle,
+      reason: String(meta.reason || ''),
+      source: String(meta.source || 'manual'),
+      ts: Date.now(),
+    });
+    saveAiExemptHandles();
+    clearQueuedAiReviewForHandle(handle);
+    removeQueuedGlobalBlockForHandle(handle);
+  }
+
+  function forgetAiExemptHandle(user) {
+    const handle = normalizeHandle(user?.handle || user);
+    if (!handle) return;
+    if (aiExemptHandles.delete(handle)) saveAiExemptHandles();
+  }
+
+  function isAiExemptHandle(handle) {
+    const key = normalizeHandle(handle);
+    if (!key) return false;
+    return aiExemptHandles.has(key);
+  }
+
+  function purgeAiMemoryForHandle(handle) {
+    const key = normalizeHandle(handle);
+    if (!key) return;
+    let changed = false;
+    for (const [fingerprint, item] of aiReviewCache.entries()) {
+      if (normalizeHandle(item?.handle || '') !== key) continue;
+      aiReviewCache.delete(fingerprint);
+      changed = true;
+    }
+    if (changed) saveAiReviewCache();
+    if (aiHiddenHandles.delete(key)) saveAiHiddenHandles();
+  }
+
+  function clearQueuedAiReviewForHandle(handle) {
+    const key = normalizeHandle(handle);
+    if (!key) return;
+    aiReviewPending.delete(key);
+    if (!aiReviewQueue.length) return;
+    for (let i = aiReviewQueue.length - 1; i >= 0; i -= 1) {
+      if (normalizeHandle(aiReviewQueue[i]?.handle || '') !== key) continue;
+      aiReviewQueue.splice(i, 1);
+    }
+  }
+
+  function removeQueuedGlobalBlockForHandle(handle) {
+    const key = normalizeHandle(handle);
+    if (!key) return false;
+    const q = readGlobalBlockQueue();
+    const item = q.items[key];
+    if (!item || (item.status || 'queued') === 'running') return false;
+    delete q.items[key];
+    writeGlobalBlockQueue(q);
+    updateGlobalBlockQueuePanel();
+    refreshGlobalBlockQueueDetailPanel(q);
+    refreshGlobalQueueInlineButtons();
+    return true;
+  }
+
+  function loadAiLearningExamples() {
+    const raw = GM_getValue(AI_LEARNING_EXAMPLES_KEY, []);
+    if (!Array.isArray(raw)) return [];
+    return raw
+      .map(item => ({
+        label: ['block', 'hide', 'ignore'].includes(item?.label) ? item.label : 'ignore',
+        handle: normalizeHandle(item?.handle || ''),
+        displayName: String(item?.displayName || ''),
+        source: String(item?.source || ''),
+        reason: String(item?.reason || ''),
+        fingerprint: String(item?.fingerprint || ''),
+        ts: Number(item?.ts || 0) || Date.now(),
+      }))
+      .filter(item => item.handle || item.displayName || item.reason);
+  }
+
+  function saveAiLearningExamples(list = aiLearningExamples) {
+    const items = (Array.isArray(list) ? list : [])
+      .sort((a, b) => Number(b.ts || 0) - Number(a.ts || 0))
+      .slice(0, AI_LEARNING_EXAMPLES_MAX);
+    aiLearningExamples = items;
+    GM_setValue(AI_LEARNING_EXAMPLES_KEY, items);
+  }
+
+  function recordAiLearningExample(user, label, meta = {}) {
+    const handle = normalizeHandle(user?.handle || '');
+    const entry = {
+      label: ['block', 'hide', 'ignore'].includes(label) ? label : 'ignore',
+      handle,
+      displayName: String(user?.displayName || ''),
+      source: String(meta.source || user?.source || ''),
+      reason: String(meta.reason || ''),
+      fingerprint: String(meta.fingerprint || aiReviewFingerprint(user || {})),
+      ts: Date.now(),
+    };
+    aiLearningExamples = aiLearningExamples.filter(item => item.fingerprint !== entry.fingerprint || item.label !== entry.label);
+    aiLearningExamples.unshift(entry);
+    saveAiLearningExamples();
+  }
+
+  function aiLearningExampleText(limit = 6) {
+    return aiLearningExamples
+      .slice(0, limit)
+      .map(item => `- ${item.label}: @${item.handle || '-'} ${item.displayName ? `(${String(item.displayName).slice(0, 40)}) ` : ''}${item.reason ? `=> ${String(item.reason).slice(0, 120)}` : ''}`)
+      .join('\n');
+  }
+
+  function maybeApplyAiRuleSuggestion(suggestion, meta = {}) {
+    if (!aiAutoRulesActive || !suggestion || !suggestion.scope || !suggestion.value) return false;
+    if (Number(suggestion.confidence || 0) < 0.85) return false;
+    const raw = String(suggestion.value || '').trim();
+    if (!raw) return false;
+    let type = '';
+    let value = raw;
+    if (suggestion.scope === 'name_keyword') type = 'name';
+    else if (suggestion.scope === 'content_keyword') type = 'content';
+    else if (suggestion.scope === 'name_regex') { type = 'regex'; value = `name:${raw}`; }
+    else if (suggestion.scope === 'content_regex') { type = 'regex'; value = `content:${raw}`; }
+    else if (suggestion.scope === 'hide_only_regex') { type = 'hide_only_regex'; value = `content:${raw}`; }
+    if (!type) return false;
+    try {
+      const added = addManualKeyword(type, value);
+      if (added) {
+        showToast(`AI 已建议并更新规则：${suggestion.scope}`, false);
+        recordAiLearningExample({
+          handle: String(meta.handle || ''),
+          displayName: String(meta.displayName || ''),
+          source: String(meta.source || 'ai_rule'),
+        }, 'ignore', {
+          reason: `auto_rule:${suggestion.scope}:${raw}`,
+        });
+      }
+      return added;
+    } catch (e) {
+      console.warn('[XFS] AI rule suggestion apply failed:', e);
+      return false;
+    }
+  }
+
+  function rememberAiHiddenHandle(user, meta = {}) {
+    const handle = normalizeHandle(user?.handle || user);
+    if (!handle) return;
+    aiHiddenHandles.set(handle, {
+      handle,
+      reason: String(meta.reason || ''),
+      confidence: Math.max(0, Math.min(1, Number(meta.confidence) || 0)),
+      source: String(meta.source || 'ai'),
+      ts: Date.now(),
+    });
+    saveAiHiddenHandles();
+  }
+
+  function isAiHiddenHandle(handle) {
+    const key = normalizeHandle(handle);
+    if (!key) return false;
+    return aiHiddenHandles.has(key);
+  }
+
+  function aiReviewCacheLookup(user) {
+    const key = aiReviewFingerprint(user);
+    const item = aiReviewCache.get(key);
+    if (!item) return null;
+    return { key, ...item };
+  }
+
+  function aiReviewCacheStore(user, result) {
+    const key = aiReviewFingerprint(user);
+    aiReviewCache.set(key, {
+      action: String(result?.action || 'ignore'),
+      confidence: Math.max(0, Math.min(1, Number(result?.confidence) || 0)),
+      reason: String(result?.reason || ''),
+      ruleSuggestion: result?.ruleSuggestion && typeof result.ruleSuggestion === 'object' ? {
+        scope: String(result.ruleSuggestion.scope || ''),
+        value: String(result.ruleSuggestion.value || ''),
+        note: String(result.ruleSuggestion.note || ''),
+        confidence: Math.max(0, Math.min(1, Number(result.ruleSuggestion.confidence) || 0)),
+      } : null,
+      handle: normalizeHandle(user?.handle || ''),
+      displayName: String(user?.displayName || ''),
+      source: String(user?.source || ''),
+      ts: Date.now(),
+    });
+    saveAiReviewCache();
+  }
+
+  const aiReviewCache = loadAiReviewCache();
+  const aiHiddenHandles = loadAiHiddenHandles();
+  const aiExemptHandles = loadAiExemptHandles();
+  let aiLearningExamples = loadAiLearningExamples();
+  const aiReviewPending = new Map();
+  const aiReviewQueue = [];
+  let aiReviewQueueActive = false;
+  let aiReviewQueueTimer = null;
+
+  function aiReviewCandidateText(user, source = '') {
+    const cats = normalizeQueuePreviewCats(user?.cats);
+    const parts = [
+      `handle: @${normalizeHandle(user?.handle || '')}`,
+      `display_name: ${String(user?.displayName || '')}`,
+      `source: ${String(source || user?.source || '')}`,
+      `cats: ${cats.join(', ') || 'none'}`,
+      `tweet_snippet: ${String(user?.tweetSnippet || '')}`,
+      `name_hits: ${Array.isArray(user?.nameKwHits) ? user.nameKwHits.join(' | ') : ''}`,
+      `heart_hits: ${Array.isArray(user?.heartHits) ? user.heartHits.join(' | ') : ''}`,
+      `keyword_hits: ${Array.isArray(user?.kwHits) ? user.kwHits.map(hit => `${hit?.kw || ''} => ${hit?.snippet || ''}`).join(' || ') : ''}`,
+      `regex_hits: ${Array.isArray(user?.reHits) ? user.reHits.map(hit => `${hit?.pat || ''} => ${hit?.snippet || ''}`).join(' || ') : ''}`,
+      `hide_only_hits: ${Array.isArray(user?.hideOnlyReHits) ? user.hideOnlyReHits.map(hit => `${hit?.pat || ''} => ${hit?.snippet || ''}`).join(' || ') : ''}`,
+    ];
+    const learned = aiLearningExampleText(6);
+    if (learned) parts.push(`learned_examples:\n${learned}`);
+    return parts.join('\n');
+  }
+
+  function isNameIssueMatch(user) {
+    if (!user) return false;
+    const heartHits = Array.isArray(user.heartHits) ? user.heartHits.length : 0;
+    const nameKwHits = Array.isArray(user.nameKwHits) ? user.nameKwHits.length : 0;
+    const nameRegexHits = Array.isArray(user.reHits)
+      ? user.reHits.filter(hit => String(hit?.snippet || '').startsWith('昵称:')).length
+      : 0;
+    return heartHits > 0 || nameKwHits > 0 || nameRegexHits > 0;
+  }
+
+  function aiReviewActionLabel(action) {
+    if (action === 'block') return '拉黑';
+    if (action === 'hide') return '隐藏';
+    return '放行';
+  }
+
+  function hasAiReviewCandidates(users) {
+    return (users || []).some(user => !isNameIssueMatch(user));
+  }
+
+  function queueAiReviewUsers(users, opts = {}) {
+    (users || []).forEach(user => {
+      const handle = normalizeHandle(user?.handle || '');
+      if (!handle || aiReviewPending.has(handle) || blockedHandles.has(handle) || globalBlockQueueItemForHandle(handle) || isAiHiddenHandle(handle) || isAiExemptHandle(handle)) return;
+      aiReviewQueue.push({
+        ...user,
+        handle,
+        source: String(opts.queueSource || user?.source || 'auto'),
+      });
+      aiReviewPending.set(handle, true);
+    });
+    processAiReviewQueue();
+  }
+
+  async function requestAiReviewDecision(user, opts = {}) {
+    const key = normalizeHandle(user?.handle || '');
+    if (!key) throw new Error('missing handle');
+    const cached = aiReviewCacheLookup(user);
+    if (cached) return { ...cached, cached: true };
+
+    const body = {
+      model: aiReviewModel(),
+      temperature: 0,
+      max_tokens: 160,
+      response_format: {
+        type: 'json_schema',
+        json_schema: {
+          name: 'xfs_ai_review',
+          schema: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              action: { type: 'string', enum: ['block', 'hide', 'ignore'] },
+              confidence: { type: 'number', minimum: 0, maximum: 1 },
+              reason: { type: 'string' },
+              rule_suggestion: {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                  scope: { type: 'string', enum: ['name_keyword', 'content_keyword', 'name_regex', 'content_regex', 'hide_only_regex'] },
+                  value: { type: 'string' },
+                  note: { type: 'string' },
+                  confidence: { type: 'number', minimum: 0, maximum: 1 },
+                },
+                required: ['scope', 'value', 'note', 'confidence'],
+              },
+            },
+            required: ['action', 'confidence', 'reason'],
+          },
+          strict: true,
+        },
+      },
+      messages: [
+        {
+          role: 'system',
+          content: '你是中文 X/Twitter 回复垃圾账号审查器。只根据用户提供的信息分类，不要推测额外事实。输出 block、hide、ignore 三选一。用户名、昵称、主页式营销、联系方式、明显引流，优先 block；正文可疑但账号不够确定，优先 hide；看起来正常或不确定，ignore。若能提炼出稳定、可复用的规则，补充一个 rule_suggestion。只输出 JSON。',
+        },
+        {
+          role: 'user',
+          content: aiReviewCandidateText(user, opts.queueSource || ''),
+        },
+      ],
+      store: false,
+      safety_identifier: stableStringHash(key),
+    };
+    const apiKey = aiReviewApiKey();
+    if (!apiKey) throw new Error('missing OpenAI API key');
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: 'POST',
+        url: 'https://api.openai.com/v1/chat/completions',
+        headers: {
+          'content-type': 'application/json',
+          authorization: `Bearer ${apiKey}`,
+        },
+        data: JSON.stringify(body),
+        onload(resp) {
+          if (resp.status < 200 || resp.status >= 300) {
+            reject(new Error(`HTTP ${resp.status}`));
+            return;
+          }
+          try {
+            const data = JSON.parse(resp.responseText || '{}');
+            const content = String(data?.choices?.[0]?.message?.content || '').trim();
+            const jsonText = content.match(/\{[\s\S]*\}/)?.[0] || content;
+            const parsed = JSON.parse(jsonText);
+            const action = ['block', 'hide', 'ignore'].includes(parsed?.action) ? parsed.action : 'ignore';
+            const confidence = Math.max(0, Math.min(1, Number(parsed?.confidence) || 0));
+            const reason = String(parsed?.reason || '').trim().slice(0, 300) || 'AI 未返回理由';
+            const ruleSuggestion = parsed?.rule_suggestion && typeof parsed.rule_suggestion === 'object' ? {
+              scope: ['name_keyword', 'content_keyword', 'name_regex', 'content_regex', 'hide_only_regex'].includes(parsed.rule_suggestion.scope) ? parsed.rule_suggestion.scope : '',
+              value: String(parsed.rule_suggestion.value || '').trim().slice(0, 120),
+              note: String(parsed.rule_suggestion.note || '').trim().slice(0, 220),
+              confidence: Math.max(0, Math.min(1, Number(parsed.rule_suggestion.confidence) || 0)),
+            } : null;
+            resolve({
+              action,
+              confidence,
+              reason,
+              ruleSuggestion,
+              model: data?.model || aiReviewModel(),
+            });
+          } catch (e) {
+            reject(e);
+          }
+        },
+        onerror() {
+          reject(new Error('Network error'));
+        },
+      });
+    });
+  }
+
+  async function processAiReviewQueue() {
+    if (aiReviewQueueActive || !aiReviewQueue.length) return;
+    aiReviewQueueActive = true;
+    try {
+      while (aiReviewQueue.length) {
+        const item = aiReviewQueue.shift();
+        const handle = normalizeHandle(item?.handle || '');
+        if (!handle) continue;
+        if (isAiExemptHandle(handle)) {
+          aiReviewPending.delete(handle);
+          continue;
+        }
+        try {
+          const decision = await requestAiReviewDecision(item, { queueSource: item.source });
+          aiReviewCacheStore(item, decision);
+          recordAiLearningExample(item, decision.action, {
+            source: item.source,
+            reason: decision.reason,
+          });
+          maybeApplyAiRuleSuggestion(decision.ruleSuggestion, {
+            handle,
+            displayName: item.displayName,
+            source: item.source,
+          });
+          if (decision.action === 'block') {
+            enqueueGlobalBlockUsers([{
+              ...item,
+              handle,
+              source: 'ai_review',
+              reason: `AI复核：${decision.reason}`,
+              aiDecision: 'block',
+              aiReason: decision.reason,
+              aiConfidence: decision.confidence,
+            }], 'ai_review');
+            showToast(`AI复核：@${handle} 已加入拉黑排队`, false);
+          } else if (decision.action === 'hide') {
+            rememberAiHiddenHandle(item, {
+              reason: decision.reason,
+              confidence: decision.confidence,
+              source: item.source || 'ai_review',
+            });
+            matchedHandlesInView.delete(handle);
+            matchedUsersCache.delete(handle);
+            matchedUsersCache.delete(normalizeHandle(handle));
+            updateHideBadge();
+            document.querySelectorAll(`article[data-testid="tweet"]`).forEach(art => {
+              const artHandle = normalizeHandle(art.dataset.xfsReferralHandle || extractHandleFromArticle(art));
+              if (artHandle !== handle) return;
+              art.dataset.xfsAiHidden = '1';
+            });
+            applyHideAll();
+            showToast(`AI复核：@${handle} 已隐藏`, false);
+          }
+        } catch (e) {
+          console.warn(`[XFS] AI review failed @${handle}:`, e);
+        } finally {
+          aiReviewPending.delete(handle);
+        }
+        await sleep(250);
+      }
+    } finally {
+      aiReviewQueueActive = false;
+    }
+  }
 
   function normalizeYoungAccountDays(value) {
     const n = parseInt(value, 10);
@@ -2571,8 +3146,8 @@
     const key = normalizeHandle(user?.handle);
     if (!key || blockedHandles.has(key) || globalBlockQueueItemForHandle(key)) return;
     if (sourceArticle && isProtectedVerifiedArticle(sourceArticle)) return;
-    const result = enqueueGlobalBlockUsers([{ ...user, handle: key, source: 'browse_auto' }], 'browse_auto');
-    if (result.added) {
+    const result = autoQueueBlockUsers([{ ...user, handle: key, source: 'browse_auto' }], { queueSource: 'browse_auto' });
+    if (result.added || result.aiReview) {
       sourceArticle?.setAttribute?.('data-xfs-auto-queued', '1');
       showToast(`边刷边拉黑：@${key} 已加入拉黑排队`, false);
     }
@@ -2587,7 +3162,7 @@
       })
       .filter(user => user && !blockedHandles.has(user.handle) && !globalBlockQueueItemForHandle(user.handle) && !isProtectedVerifiedHandle(user.handle));
     if (!users.length) return;
-    const result = enqueueGlobalBlockUsers(users, 'browse_auto');
+    const result = autoQueueBlockUsers(users, { queueSource: 'browse_auto' });
     if (result.added) showToast(`边刷边拉黑：已补入队 ${result.added} 个已扫到账号`, false);
   }
 
@@ -2709,6 +3284,8 @@
         const label = GLOBAL_QUEUE_STATUS_LABELS[status] || status;
         const detail = [
           item.source ? `来源 ${item.source}` : '',
+          item.aiDecision ? `AI ${item.aiDecision}${item.aiConfidence ? ` ${Math.round(Number(item.aiConfidence) * 100)}%` : ''}` : '',
+          item.aiReason ? `AI理由 ${item.aiReason}` : '',
           item.attempts ? `尝试 ${item.attempts}` : '',
           item.error ? `错误 ${item.error}` : '',
         ].filter(Boolean).join(' · ');
@@ -2794,12 +3371,14 @@
     let added = 0;
     let existing = 0;
     let skipped = 0;
+    const manualish = ['manual', 'panel', 'inline'].includes(String(source || 'manual'));
     (users || []).forEach(user => {
       const key = normalizeHandle(user?.handle || user);
-      if (!key || blockedHandles.has(key) || isProtectedVerifiedHandle(key)) {
+      if (!key || blockedHandles.has(key) || isProtectedVerifiedHandle(key) || (!manualish && isAiExemptHandle(key))) {
         skipped += 1;
         return;
       }
+      if (manualish) forgetAiExemptHandle(key);
       const preview = {
         displayName: String(user?.displayName || user?.handle || key),
         reason: String(user?.reason || user?.tweetSnippet || ''),
@@ -2810,6 +3389,9 @@
         kwHits: normalizeQueueKeywordHits(user?.kwHits),
         reHits: normalizeQueueRegexHits(user?.reHits),
         hideOnlyReHits: normalizeQueueRegexHits(user?.hideOnlyReHits),
+        aiDecision: String(user?.aiDecision || ''),
+        aiReason: String(user?.aiReason || ''),
+        aiConfidence: Number(user?.aiConfidence || 0),
       };
       const prev = q.items[key];
       if (prev && ['queued', 'running'].includes(prev.status)) {
@@ -2826,6 +3408,9 @@
           kwHits: Array.isArray(prev.kwHits) && prev.kwHits.length ? prev.kwHits : preview.kwHits,
           reHits: Array.isArray(prev.reHits) && prev.reHits.length ? prev.reHits : preview.reHits,
           hideOnlyReHits: Array.isArray(prev.hideOnlyReHits) && prev.hideOnlyReHits.length ? prev.hideOnlyReHits : preview.hideOnlyReHits,
+          aiDecision: prev.aiDecision || preview.aiDecision,
+          aiReason: prev.aiReason || preview.aiReason,
+          aiConfidence: Number.isFinite(Number(prev.aiConfidence)) ? Number(prev.aiConfidence) : preview.aiConfidence,
           updatedAt: now,
         };
         return;
@@ -2846,6 +3431,9 @@
         kwHits: preview.kwHits,
         reHits: preview.reHits,
         hideOnlyReHits: preview.hideOnlyReHits,
+        aiDecision: preview.aiDecision,
+        aiReason: preview.aiReason,
+        aiConfidence: preview.aiConfidence,
         status: 'queued',
         attempts: Math.max(0, Number(prev?.attempts || 0)),
         addedAt: Number(prev?.addedAt || now),
@@ -2867,12 +3455,29 @@
 
   function autoQueueBlockUsers(users, opts = {}) {
     const safeUsers = (users || []).filter(user => !isProtectedVerifiedHandle(user?.handle || user));
-    const result = enqueueGlobalBlockUsers(safeUsers, opts.queueSource || 'auto');
+    const source = opts.queueSource || 'auto';
+    const useAiReview = aiReviewConfigured() && source !== 'manual' && source !== 'panel' && source !== 'inline';
+    const directUsers = [];
+    const reviewUsers = [];
+    safeUsers.forEach(user => {
+      if (!user) return;
+      if (isAiHiddenHandle(user?.handle || '') || isAiExemptHandle(user?.handle || '')) return;
+      if (!useAiReview || isNameIssueMatch(user)) directUsers.push(user);
+      else reviewUsers.push(user);
+    });
+    const result = enqueueGlobalBlockUsers(directUsers, source);
+    if (reviewUsers.length) {
+      queueAiReviewUsers(reviewUsers, opts);
+    }
     refreshGlobalQueueInlineButtons();
-    const msg = `已加入拉黑排队 ${result.added} 个${result.existing ? `，已有 ${result.existing} 个` : ''}${result.skipped ? `，跳过 ${result.skipped} 个` : ''}`;
-    if (result.added || result.existing || result.skipped) showToast(msg, false);
-    if (result.added || result.existing) markCleanupButtonsComplete(opts.refreshButtonIds);
-    opts.onBlockDone?.({ queued: result.added, existing: result.existing, skipped: result.skipped, total: safeUsers.length });
+    result.aiDirect = directUsers.length;
+    result.aiReview = reviewUsers.length;
+    const msg = useAiReview && reviewUsers.length
+      ? `已加入拉黑排队 ${result.added} 个${result.existing ? `，已有 ${result.existing} 个` : ''}${reviewUsers.length ? `，AI复核 ${reviewUsers.length} 个` : ''}${result.skipped ? `，跳过 ${result.skipped} 个` : ''}`
+      : `已加入拉黑排队 ${result.added} 个${result.existing ? `，已有 ${result.existing} 个` : ''}${result.skipped ? `，跳过 ${result.skipped} 个` : ''}`;
+    if (result.added || result.existing || result.skipped || (useAiReview && reviewUsers.length)) showToast(msg, false);
+    if (result.added || result.existing || reviewUsers.length) markCleanupButtonsComplete(opts.refreshButtonIds);
+    opts.onBlockDone?.({ queued: result.added, existing: result.existing, skipped: result.skipped, aiReview: reviewUsers.length, total: safeUsers.length });
     return result;
   }
 
@@ -3071,6 +3676,13 @@
           .sort((a, b) => Number(a.addedAt || 0) - Number(b.addedAt || 0))[0];
         if (!next) break;
         const key = normalizeHandle(next.handle);
+        if (isAiExemptHandle(key)) {
+          delete q.items[key];
+          writeGlobalBlockQueue(q);
+          updateGlobalBlockQueuePanel();
+          refreshGlobalBlockQueueDetailPanel(q);
+          continue;
+        }
         const csrf = getCsrf();
         if (!csrf) {
           pauseGlobalQueueForAuthLoss('未找到登录凭证（ct0 cookie）');
@@ -4790,10 +5402,22 @@
       clearProtectedVerifiedArticleState(art);
       return;
     }
+    const handle = extractHandleFromArticle(art);
+    if (isAiExemptHandle(handle)) {
+      art.dataset.xfsAiHidden = '';
+      if (art.dataset.xfsHidden === '1') {
+        art.dataset.xfsHidden = '';
+        ['max-height','min-height','overflow','padding','margin-top','margin-bottom','pointer-events','border-bottom']
+          .forEach(p => art.style.removeProperty(p));
+      }
+      clearBlockedArticleStyle(art);
+      return;
+    }
     const shouldHideMatched = hideMatchedActive && art.dataset.xfsHideMatched === '1';
     const shouldHideReferral = hideReferralActive && art.dataset.xfsReferralAccount === '1';
     const shouldHideBlocked = shouldHideBlockedArticles() && art.dataset.xfsBlocked === '1';
-    const shouldHide = shouldHideMatched || shouldHideReferral || shouldHideBlocked;
+    const shouldHideAi = isAiHiddenHandle(handle);
+    const shouldHide = shouldHideMatched || shouldHideReferral || shouldHideBlocked || shouldHideAi;
     if (shouldHide && art.dataset.xfsHidden !== '1') {
       if (shouldHideMatched) incrementHideRuleStatsFromArticle(art);
       art.dataset.xfsHidden = '1';
@@ -6180,6 +6804,82 @@
     });
     refreshHideOnlyRulesControls();
 
+    function refreshAiReviewControls() {
+      aiReviewBtn.textContent = `AI 复核：${aiReviewActive ? '开' : '关'}`;
+      aiReviewBtn.style.borderColor = aiReviewActive ? C.nameKw : C.btnBorder;
+      aiReviewBtn.style.color = aiReviewActive ? C.nameKw : C.sub;
+      aiReviewBtn.style.background = aiReviewActive ? '#f2fbfc' : '#fff';
+      aiAutoRuleBtn.textContent = `AI 自动改规则：${aiAutoRulesActive ? '开' : '关'}`;
+      aiAutoRuleBtn.style.borderColor = aiAutoRulesActive ? C.regexKw : C.btnBorder;
+      aiAutoRuleBtn.style.color = aiAutoRulesActive ? C.regexKw : C.sub;
+      aiAutoRuleBtn.style.background = aiAutoRulesActive ? '#f2fbfc' : '#fff';
+      aiReviewModelInput.value = aiReviewModel();
+      aiReviewKeyInput.value = aiReviewApiKey();
+      aiReviewStatus.textContent = aiReviewConfigured()
+        ? `模型 ${aiReviewModelInput.value || aiReviewModel()} · key 已配置 · 学习样本 ${aiLearningExamples.length} 条 · 自动改规则 ${aiAutoRulesActive ? '开' : '关'}`
+        : (aiReviewActive ? '已开启，但尚未配置 API key' : '默认关闭；开启后，非用户名命中的可疑账号会先送 AI 复核。');
+      aiReviewStatus.title = aiReviewStatus.textContent;
+    }
+
+    const aiReviewWrap = document.createElement('div');
+    aiReviewWrap.style.cssText = `border:1px solid ${C.nameKw};background:#f7feff;border-radius:8px;padding:7px;display:flex;flex-direction:column;gap:6px;`;
+    const aiReviewTitle = document.createElement('div');
+    aiReviewTitle.textContent = 'AI 复核';
+    aiReviewTitle.style.cssText = `font-size:11px;font-weight:800;color:${C.nameKw};`;
+    const aiReviewNote = document.createElement('div');
+    aiReviewNote.textContent = '用户名/昵称问题直接拉黑；其余可疑账号交给 AI 复核。AI 只做 block / hide / ignore 三选一。';
+    aiReviewNote.style.cssText = `font-size:10px;line-height:1.35;color:${C.sub};`;
+    const aiReviewBtn = mkToolBtn('', () => {
+      aiReviewActive = !aiReviewActive;
+      GM_setValue(AI_REVIEW_ENABLED_KEY, aiReviewActive);
+      refreshAiReviewControls();
+      showToast(aiReviewActive ? 'AI 复核已开启' : 'AI 复核已关闭', false);
+    });
+    const aiAutoRuleBtn = mkToolBtn('', () => {
+      aiAutoRulesActive = !aiAutoRulesActive;
+      GM_setValue(AI_AUTO_RULES_KEY, aiAutoRulesActive);
+      refreshAiReviewControls();
+      showToast(aiAutoRulesActive ? 'AI 自动改规则已开启' : 'AI 自动改规则已关闭', false);
+    });
+    const aiReviewModelInput = document.createElement('input');
+    aiReviewModelInput.type = 'text';
+    aiReviewModelInput.placeholder = AI_REVIEW_DEFAULT_MODEL;
+    aiReviewModelInput.style.cssText = `border:1px solid ${C.btnBorder};border-radius:8px;padding:5px 8px;font-size:10px;width:100%;box-sizing:border-box;`;
+    aiReviewModelInput.onchange = () => {
+      const next = normalizeAiReviewModel(aiReviewModelInput.value);
+      aiReviewModelInput.value = next;
+      GM_setValue(AI_REVIEW_MODEL_KEY, next);
+      refreshAiReviewControls();
+      showToast(`AI 模型已保存：${next}`, false);
+    };
+    const aiReviewKeyInput = document.createElement('input');
+    aiReviewKeyInput.type = 'password';
+    aiReviewKeyInput.placeholder = 'OpenAI API key';
+    aiReviewKeyInput.autocomplete = 'off';
+    aiReviewKeyInput.style.cssText = `border:1px solid ${C.btnBorder};border-radius:8px;padding:5px 8px;font-size:10px;width:100%;box-sizing:border-box;`;
+    aiReviewKeyInput.onchange = () => {
+      const next = String(aiReviewKeyInput.value || '').trim();
+      GM_setValue(AI_REVIEW_API_KEY_KEY, next);
+      refreshAiReviewControls();
+      showToast(next ? 'AI API key 已保存' : 'AI API key 已清空', false);
+    };
+    const aiReviewClearBtn = mkToolBtn('清除 API key', () => {
+      aiReviewKeyInput.value = '';
+      GM_setValue(AI_REVIEW_API_KEY_KEY, '');
+      refreshAiReviewControls();
+      showToast('AI API key 已清空', false);
+    });
+    const aiReviewStatus = document.createElement('div');
+    aiReviewStatus.style.cssText = `font-size:10px;line-height:1.35;color:${C.sub};word-break:break-word;`;
+    aiReviewWrap.appendChild(aiReviewTitle);
+    aiReviewWrap.appendChild(aiReviewBtn);
+    aiReviewWrap.appendChild(aiAutoRuleBtn);
+    aiReviewWrap.appendChild(aiReviewModelInput);
+    aiReviewWrap.appendChild(aiReviewKeyInput);
+    aiReviewWrap.appendChild(aiReviewClearBtn);
+    aiReviewWrap.appendChild(aiReviewStatus);
+    refreshAiReviewControls();
+
     function refreshRemoteRulesControls() {
       remoteRulesBtn.textContent = `远程规则订阅：${remoteRulesActive ? '开' : '关'}`;
       remoteRulesBtn.style.borderColor = remoteRulesActive ? C.nameKw : C.btnBorder;
@@ -6384,6 +7084,7 @@
     grid.appendChild(autoReferralBtn);
     grid.appendChild(verifiedProtectBtn);
     grid.appendChild(hideOnlyRulesBtn);
+    grid.appendChild(aiReviewWrap);
     grid.appendChild(remoteWrap);
     grid.appendChild(youngWrap);
     grid.appendChild(mkToolBtn('两类账号说明', showCategoryHelp));
@@ -6613,6 +7314,9 @@
             blockedHandles.delete(handle);
             blockedHandles.delete(normalizeHandle(handle));
             undimArticlesByHandle(handle);
+            purgeAiMemoryForHandle(handle);
+            rememberAiExemptHandle(handle, { source: 'manual_unblock', reason: 'manual unblock' });
+            recordAiLearningExample({ handle, displayName, source: 'manual_unblock' }, 'ignore', { reason: 'manual unblock' });
             showToast(`@${handle} 已取消拉黑`, false);
             document.querySelectorAll(`button[data-xfs-handle="${CSS.escape(handle)}"]`).forEach(b => {
               b.dataset.xfsState = 'unblocked';
