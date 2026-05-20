@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         垃圾推号大扫除 - 自用版
 // @namespace    http://tampermonkey.net/
-// @version      6.17.4
+// @version      6.17.5
 // @description  扫描推文回复中的垃圾用户批量拉黑
 // @author       summeriscoming
 // @license MIT
@@ -5340,7 +5340,7 @@
     const pos = clampGlobalBlockQueuePosition(readGlobalBlockQueuePosition(), p);
     p.style.left = `${pos.left}px`;
     p.style.top = `${pos.top}px`;
-    p.style.opacity = active || counts.failed ? '1' : '0.72';
+    p.style.opacity = '1';
     p.innerHTML = '';
     const hdr = document.createElement('div');
     hdr.style.cssText = 'display:flex;flex-direction:column;align-items:stretch;gap:6px;';
@@ -5357,6 +5357,7 @@
     dismissBtn.title = '关闭此卡片；可从排队详情再次打开';
     dismissBtn.style.cssText = `border:1px solid ${C.btnBorder};border-radius:7px;background:#fff;color:${C.sub};font-size:10px;font-weight:800;padding:2px 5px;cursor:pointer;line-height:1.2;`;
     dismissBtn.onclick = () => {
+      globalQueuePanelSuppressed = true;
       p.remove();
     };
     topActions.appendChild(dismissBtn);
