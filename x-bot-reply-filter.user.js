@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         垃圾推号大扫除 - 自用版
 // @namespace    http://tampermonkey.net/
-// @version      6.17.1
+// @version      6.17.2
 // @description  扫描推文回复中的垃圾用户批量拉黑
 // @author       summeriscoming
 // @license MIT
@@ -16,8 +16,8 @@
 // @connect      raw.githubusercontent.com
 // @connect      api.github.com
 // @run-at       document-start
-// @downloadURL https://update.greasyfork.org/scripts/573991/%E5%9E%83%E5%9C%BE%E6%8E%A8%E5%8F%B7%E5%A4%A7%E6%89%AB%E9%99%A4.user.js
-// @updateURL https://update.greasyfork.org/scripts/573991/%E5%9E%83%E5%9C%BE%E6%8E%A8%E5%8F%B7%E5%A4%A7%E6%89%AB%E9%99%A4.meta.js
+// @downloadURL https://raw.githubusercontent.com/shenyue019-blip/x-bot-reply-filter/main/x-bot-reply-filter.user.js
+// @updateURL https://raw.githubusercontent.com/shenyue019-blip/x-bot-reply-filter/main/x-bot-reply-filter.user.js
 // ==/UserScript==
 
 (function () {
