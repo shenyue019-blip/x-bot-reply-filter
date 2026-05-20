@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         垃圾推号大扫除 - 自用版
 // @namespace    http://tampermonkey.net/
-// @version      6.18.4
+// @version      6.18.5
 // @description  扫描推文回复中的垃圾用户批量拉黑
 // @author       summeriscoming
 // @license MIT
@@ -638,6 +638,7 @@
   let globalQueueUiTimer = null;
   let globalQueuePanelDragging = false;
   let globalQueuePanelSuppressed = false;
+  let refreshAiReviewControlsFn = null;
   let experimentalBrowseBlockHeartbeatTimer = null;
   const matchedHandlesInView = new Set(); // accumulates matched handles this scroll session; reset on nav
   const matchedUsersCache = new Map();   // handle → full user object; survives DOM unload by React virtual list
@@ -1257,6 +1258,7 @@
     aiLearningExamples = aiLearningExamples.filter(item => item.fingerprint !== entry.fingerprint || item.label !== entry.label);
     aiLearningExamples.unshift(entry);
     saveAiLearningExamples();
+    if (typeof refreshAiReviewControlsFn === 'function') refreshAiReviewControlsFn();
   }
 
   function aiLearningExampleText(limit = 6) {
@@ -6900,6 +6902,7 @@
         : (aiReviewActive ? '已开启，但尚未配置 API key' : '默认关闭；开启后，非用户名命中的可疑账号会先送 AI 复核。');
       aiReviewStatus.title = aiReviewStatus.textContent;
     }
+    refreshAiReviewControlsFn = refreshAiReviewControls;
 
     const aiReviewWrap = document.createElement('div');
     aiReviewWrap.style.cssText = `border:1px solid ${C.nameKw};background:#f7feff;border-radius:8px;padding:7px;display:flex;flex-direction:column;gap:6px;`;
