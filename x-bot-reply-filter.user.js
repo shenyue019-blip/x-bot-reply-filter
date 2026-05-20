@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         垃圾推号大扫除 - 自用版
 // @namespace    http://tampermonkey.net/
-// @version      6.18.11
+// @version      6.18.12
 // @description  扫描推文回复中的垃圾用户批量拉黑
 // @author       summeriscoming
 // @license MIT
@@ -644,7 +644,7 @@
   let globalQueuePanelSuppressed = false;
   let refreshAiReviewControlsFn = null;
   let refreshAiLearningControlsFn = null;
-  let refreshAiWorkLogControlsFn = null;
+  let refreshAiWorkLogPanelFn = null;
   let experimentalBrowseBlockHeartbeatTimer = null;
   const matchedHandlesInView = new Set(); // accumulates matched handles this scroll session; reset on nav
   const matchedUsersCache = new Map();   // handle → full user object; survives DOM unload by React virtual list
@@ -1330,7 +1330,198 @@
     };
     aiWorkLog.unshift(item);
     saveAiWorkLog();
-    if (typeof refreshAiWorkLogControlsFn === 'function') refreshAiWorkLogControlsFn();
+    if (typeof refreshAiWorkLogPanelFn === 'function') refreshAiWorkLogPanelFn();
+  }
+
+  function aiWorkLogTone(item) {
+    if (item.kind === 'error') return C.blockRed;
+    if (item.kind === 'key_check') return C.regexKw;
+    if (item.kind === 'test') return C.nameKw;
+    if (item.action === 'block') return C.blockRed;
+    if (item.action === 'hide') return C.mute;
+    return C.sub;
+  }
+
+  function aiWorkLogActionLabel(item) {
+    if (item.kind === 'error') return '错误';
+    if (item.kind === 'key_check') return 'API key';
+    if (item.kind === 'test') return '试跑';
+    return item.action === 'block' ? '拉黑' : (item.action === 'hide' ? '隐藏' : '放行');
+  }
+
+  function aiWorkLogActionHint(item) {
+    if (item.kind === 'error') return 'AI 失败';
+    if (item.kind === 'key_check') return 'key 检测';
+    if (item.kind === 'test') return 'AI 试跑';
+    return item.action === 'block' ? 'AI 判断：拉黑' : (item.action === 'hide' ? 'AI 判断：隐藏' : 'AI 判断：放行');
+  }
+
+  function applyAiWorkLogCorrection(item, nextLabel) {
+    const handle = normalizeHandle(item?.handle || '');
+    if (!handle) return;
+    const base = {
+      handle,
+      displayName: String(item?.displayName || handle),
+      source: 'ai_correction',
+      reason: `ai_${String(item?.action || 'ignore')}=>${nextLabel}`,
+    };
+    recordAiWorkLog({
+      kind: 'correction',
+      label: nextLabel,
+      action: nextLabel,
+      handle,
+      displayName: base.displayName,
+      source: 'ai_correction',
+      reason: base.reason,
+      confidence: Number(item?.confidence || 0),
+      fingerprint: `${String(item?.fingerprint || '')}:correction:${nextLabel}`,
+    });
+    recordAiLearningExample(base, nextLabel, { source: 'ai_correction', reason: base.reason, fingerprint: `${String(item?.fingerprint || '')}:learning:${nextLabel}` });
+    if (nextLabel === 'block') {
+      forgetAiExemptHandle(handle);
+      enqueueGlobalBlockUsers([{ ...base, source: 'manual' }], 'manual');
+      showToast(`已将 @${handle} 纠正为拉黑候选`, false);
+    } else if (nextLabel === 'hide') {
+      rememberAiHiddenHandle(base, { source: 'ai_correction', reason: base.reason, confidence: Number(item?.confidence || 0) });
+      applyHideAll();
+      showToast(`已将 @${handle} 纠正为隐藏`, false);
+    } else {
+      purgeAiMemoryForHandle(handle);
+      rememberAiExemptHandle(base, { source: 'ai_correction', reason: base.reason });
+      removeQueuedGlobalBlockForHandle(handle);
+      showToast(`已将 @${handle} 纠正为放行`, false);
+    }
+    if (typeof refreshAiWorkLogPanelFn === 'function') refreshAiWorkLogPanelFn();
+    if (typeof refreshAiLearningControlsFn === 'function') refreshAiLearningControlsFn();
+    if (typeof refreshAiReviewControlsFn === 'function') refreshAiReviewControlsFn();
+  }
+
+  function renderAiWorkLogRows(listEl, statusEl) {
+    const recent = aiWorkLog.slice(0, 30);
+    if (statusEl) {
+      statusEl.textContent = recent.length
+        ? `记录 ${aiWorkLog.length} 条 · 最新 ${recent[0].kind} / ${recent[0].action} @${recent[0].handle || '-'}${recent[0].reason ? ` · ${recent[0].reason}` : ''}`
+        : '暂无 AI 工作记录';
+      statusEl.title = statusEl.textContent;
+    }
+    listEl.textContent = '';
+    if (!recent.length) {
+      const empty = document.createElement('div');
+      empty.textContent = '暂无工作记录';
+      empty.style.cssText = `font-size:10px;color:${C.sub};padding:8px 0;`;
+      listEl.appendChild(empty);
+      return;
+    }
+    recent.forEach(item => {
+      const color = aiWorkLogTone(item);
+      const wrap = document.createElement('div');
+      wrap.style.cssText = 'break-inside:avoid;page-break-inside:avoid;position:relative;';
+      const row = document.createElement('div');
+      row.style.cssText = `display:flex;align-items:flex-start;gap:4px;padding:1px 22px 1px 4px;cursor:pointer;border-bottom:1px solid ${C.border};border-left:3px solid ${color};line-height:1.18;background:#fff;`;
+      row.title = [
+        aiWorkLogActionHint(item),
+        `AI 判断：${aiWorkLogActionLabel(item)}`,
+        item.displayName ? `昵称: ${item.displayName}` : '',
+        item.handle ? `@${item.handle}` : '',
+        item.source ? `来源: ${item.source}` : '',
+        item.reason ? `原因: ${item.reason}` : '',
+        item.ruleSuggestion ? `建议: ${item.ruleSuggestion.scope} = ${item.ruleSuggestion.value}` : '',
+      ].filter(Boolean).join('\n');
+      row.onmouseenter = () => { row.style.background = C.rowHover; };
+      row.onmouseleave = () => { row.style.background = '#fff'; };
+
+      const status = document.createElement('span');
+      status.textContent = item.kind === 'error' ? '!' : (item.kind === 'key_check' ? '✓' : (item.action === 'block' ? '●' : (item.action === 'hide' ? '◐' : '•')));
+      status.title = aiWorkLogActionHint(item);
+      status.style.cssText = `width:13px;margin-top:1px;flex-shrink:0;text-align:center;font-size:12px;font-weight:800;color:${color};`;
+      row.appendChild(status);
+
+      const info = document.createElement('div');
+      info.style.cssText = 'flex:1;min-width:0;';
+      const profileUrl = item.handle && !['api_key', ''].includes(item.handle) ? `https://x.com/${encodeURIComponent(item.handle)}` : '';
+      const profileTitle = profileUrl ? `打开 @${item.handle} 主页` : '';
+      let html = `<div class="xfs-name" style="font-size:11px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${profileUrl ? `<a class="xfs-profile-link" href="${profileUrl}" target="_blank" rel="noopener noreferrer" title="${esc(profileTitle)}" style="color:inherit;text-decoration:underline;text-decoration-thickness:1px;text-underline-offset:2px;">${esc(item.displayName || item.handle || item.kind)}</a>` : esc(item.displayName || item.handle || item.kind)}</div>`;
+      html += `<div style="color:${C.sub};font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(item.handle ? `@${item.handle}` : item.source || '')}</div>`;
+      html += `<div style="font-size:9px;color:${color};font-weight:800;">AI 判断：${esc(aiWorkLogActionLabel(item))}${item.confidence ? ` · ${Math.round(item.confidence * 100)}%` : ''}</div>`;
+      if (item.reason) html += `<div style="font-size:9px;color:${C.sub};word-break:break-all;">${esc(item.reason)}</div>`;
+      if (item.ruleSuggestion?.scope && item.ruleSuggestion?.value) {
+        html += `<div style="font-size:9px;color:${C.regexKw};word-break:break-all;">建议规则: ${esc(item.ruleSuggestion.scope)} = ${esc(item.ruleSuggestion.value)}</div>`;
+      }
+      info.innerHTML = html;
+      row.appendChild(info);
+
+      const actions = document.createElement('div');
+      actions.style.cssText = 'position:absolute;top:4px;right:5px;display:flex;gap:4px;align-items:center;';
+      const actionDefs = [
+        { label: '判错，改拉黑', value: 'block', color: C.blockRed },
+        { label: '判错，改隐藏', value: 'hide', color: C.mute },
+        { label: '判错，改放行', value: 'ignore', color: C.sub },
+      ];
+      actionDefs.forEach(def => {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.textContent = def.label;
+        b.title = `把当前 AI 判断 ${aiWorkLogActionLabel(item)} 纠正为 ${def.label.replace('判错，改', '')}`;
+        b.style.cssText = `border:1px solid ${C.btnBorder};background:#fff;color:${def.color};border-radius:6px;padding:2px 6px;font-size:10px;font-weight:700;cursor:pointer;`;
+        b.onclick = () => applyAiWorkLogCorrection(item, def.value);
+        actions.appendChild(b);
+      });
+      row.appendChild(actions);
+      wrap.appendChild(row);
+      listEl.appendChild(wrap);
+    });
+  }
+
+  function showAiWorkLogPanel() {
+    const existing = document.getElementById('xfs-ai-work-log-panel');
+    if (existing) existing.remove();
+    const p = document.createElement('div');
+    p.id = 'xfs-ai-work-log-panel';
+    p.style.cssText = [
+      'position:fixed', `right:${toolbarRightPx(40)}`, `bottom:${toolbarBottomPx(166)}`,
+      'width:min(520px, calc(100vw - 24px))', 'height:min(72vh, 640px)', 'box-sizing:border-box', 'padding:8px',
+      'background:rgba(255,255,255,0.97)',
+      'backdrop-filter:blur(6px)', '-webkit-backdrop-filter:blur(6px)',
+      `border:1px solid ${C.mute}`,
+      'border-radius:8px',
+      'box-shadow:0 6px 22px rgba(15,20,25,0.14)',
+      `font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif`,
+      `color:${C.text}`, 'font-size:12px',
+      'display:flex', 'flex-direction:column', 'gap:6px',
+      'z-index:2147483647',
+    ].join(';');
+
+    const hdr = document.createElement('div');
+    hdr.style.cssText = `display:flex;align-items:center;gap:8px;padding:2px 2px 4px;border-bottom:1px solid ${C.border};`;
+    const title = document.createElement('div');
+    title.textContent = 'AI 工作记录';
+    title.style.cssText = `flex:1;font-size:12px;font-weight:800;color:${C.mute};`;
+    const refreshBtn = document.createElement('button');
+    refreshBtn.type = 'button';
+    refreshBtn.textContent = '刷新';
+    refreshBtn.style.cssText = `border:1px solid ${C.btnBorder};background:#fff;color:${C.sub};border-radius:7px;padding:3px 8px;font-size:11px;cursor:pointer;`;
+    const closeBtn = document.createElement('button');
+    closeBtn.type = 'button';
+    closeBtn.textContent = '关闭';
+    closeBtn.style.cssText = `border:1px solid ${C.btnBorder};background:#fff;color:${C.sub};border-radius:7px;padding:3px 8px;font-size:11px;cursor:pointer;`;
+    const status = document.createElement('div');
+    status.style.cssText = `font-size:10px;line-height:1.35;color:${C.sub};word-break:break-word;`;
+    const list = document.createElement('div');
+    list.style.cssText = 'flex:1;min-height:0;overflow:auto;padding-right:2px;display:flex;flex-direction:column;gap:4px;';
+    const refresh = () => {
+      renderAiWorkLogRows(list, status);
+    };
+    refreshBtn.onclick = refresh;
+    closeBtn.onclick = () => p.remove();
+    hdr.appendChild(title);
+    hdr.appendChild(refreshBtn);
+    hdr.appendChild(closeBtn);
+    p.appendChild(hdr);
+    p.appendChild(status);
+    p.appendChild(list);
+    document.body.appendChild(p);
+    refresh();
+    refreshAiWorkLogPanelFn = refresh;
   }
 
   function recordAiLearningExample(user, label, meta = {}) {
@@ -6291,6 +6482,7 @@
       ['xfs-sweep-btn', 320, 0],
       ['xfs-queue-btn', 320, 40],
       ['xfs-btn', 360, 0],
+      ['xfs-ai-log-btn', 360, 40],
       ['xfs-hide-btn', 400, 0],
       ['xfs-btn-backdrop', 196, -4],
       ['xfs-btn-section-settings', 200, -2],
@@ -7090,7 +7282,7 @@
       } finally {
         aiReviewTestBtn.disabled = false;
         aiReviewTestBtn.textContent = 'AI 试跑';
-        refreshAiWorkLogControls();
+        if (typeof refreshAiWorkLogPanelFn === 'function') refreshAiWorkLogPanelFn();
         refreshAiLearningControls();
       }
     });
@@ -7161,7 +7353,7 @@
       } finally {
         aiKeyTestBtn.disabled = false;
         aiKeyTestBtn.textContent = '检测 API key';
-        refreshAiWorkLogControls();
+        if (typeof refreshAiWorkLogPanelFn === 'function') refreshAiWorkLogPanelFn();
       }
     });
     aiKeyTestBtn.style.borderColor = C.regexKw;
@@ -7261,135 +7453,6 @@
     aiLearningWrap.appendChild(aiLearningStatus);
     aiLearningWrap.appendChild(aiLearningList);
     refreshAiLearningControls();
-
-    const aiWorkLogWrap = document.createElement('div');
-    aiWorkLogWrap.style.cssText = `border:1px solid ${C.mute};background:#f7fffd;border-radius:8px;padding:7px;display:flex;flex-direction:column;gap:6px;`;
-    const aiWorkLogTitle = document.createElement('div');
-    aiWorkLogTitle.textContent = 'AI 工作记录';
-    aiWorkLogTitle.style.cssText = `font-size:11px;font-weight:800;color:${C.mute};`;
-    const aiWorkLogStatus = document.createElement('div');
-    aiWorkLogStatus.style.cssText = `font-size:10px;line-height:1.35;color:${C.sub};word-break:break-word;`;
-    const aiWorkLogList = document.createElement('div');
-    aiWorkLogList.style.cssText = `display:flex;flex-direction:column;gap:4px;max-height:190px;overflow:auto;padding-right:2px;`;
-    function applyAiWorkLogCorrection(item, nextLabel) {
-      const handle = normalizeHandle(item?.handle || '');
-      if (!handle) return;
-      const base = {
-        handle,
-        displayName: String(item?.displayName || handle),
-        source: 'ai_correction',
-        reason: `ai_${String(item?.action || 'ignore')}=>${nextLabel}`,
-      };
-      recordAiWorkLog({
-        kind: 'correction',
-        label: nextLabel,
-        action: nextLabel,
-        handle,
-        displayName: base.displayName,
-        source: 'ai_correction',
-        reason: base.reason,
-        confidence: Number(item?.confidence || 0),
-        fingerprint: `${String(item?.fingerprint || '')}:correction:${nextLabel}`,
-      });
-      recordAiLearningExample(base, nextLabel, { source: 'ai_correction', reason: base.reason, fingerprint: `${String(item?.fingerprint || '')}:learning:${nextLabel}` });
-      if (nextLabel === 'block') {
-        forgetAiExemptHandle(handle);
-        enqueueGlobalBlockUsers([{ ...base, source: 'manual' }], 'manual');
-        showToast(`已将 @${handle} 纠正为拉黑候选`, false);
-      } else if (nextLabel === 'hide') {
-        rememberAiHiddenHandle(base, { source: 'ai_correction', reason: base.reason, confidence: Number(item?.confidence || 0) });
-        applyHideAll();
-        showToast(`已将 @${handle} 纠正为隐藏`, false);
-      } else {
-        purgeAiMemoryForHandle(handle);
-        rememberAiExemptHandle(base, { source: 'ai_correction', reason: base.reason });
-        removeQueuedGlobalBlockForHandle(handle);
-        showToast(`已将 @${handle} 纠正为放行`, false);
-      }
-      refreshAiWorkLogControls();
-      refreshAiLearningControls();
-      refreshAiReviewControls();
-    }
-    function refreshAiWorkLogControls() {
-      const recent = aiWorkLog.slice(0, 12);
-      aiWorkLogStatus.textContent = recent.length
-        ? `记录 ${aiWorkLog.length} 条 · 最新 ${recent[0].kind} / ${recent[0].action} @${recent[0].handle || '-'}${recent[0].reason ? ` · ${recent[0].reason}` : ''}`
-        : '暂无 AI 工作记录';
-      aiWorkLogStatus.title = aiWorkLogStatus.textContent;
-      aiWorkLogList.textContent = '';
-      if (!recent.length) {
-        const empty = document.createElement('div');
-        empty.textContent = '暂无工作记录';
-        empty.style.cssText = `font-size:10px;color:${C.sub};padding:4px 0;`;
-        aiWorkLogList.appendChild(empty);
-        return;
-      }
-      const logColor = item => {
-        if (item.kind === 'error') return C.blockRed;
-        if (item.kind === 'key_check') return C.regexKw;
-        if (item.kind === 'test') return C.nameKw;
-        if (item.label === 'block') return C.blockRed;
-        if (item.label === 'hide') return C.mute;
-        return C.sub;
-      };
-      recent.forEach(item => {
-        const color = logColor(item);
-        const wrap = document.createElement('div');
-        wrap.style.cssText = 'break-inside:avoid;page-break-inside:avoid;position:relative;';
-        const row = document.createElement('div');
-        row.style.cssText = `display:flex;align-items:flex-start;gap:4px;padding:1px 22px 1px 4px;cursor:pointer;border-bottom:1px solid ${C.border};border-left:3px solid ${color};line-height:1.18;background:#fff;`;
-        row.title = [
-          `${item.kind} · ${item.action} · @${item.handle || '-'}`,
-          item.displayName ? `昵称: ${item.displayName}` : '',
-          item.source ? `来源: ${item.source}` : '',
-          item.reason ? `原因: ${item.reason}` : '',
-          item.ruleSuggestion ? `建议: ${item.ruleSuggestion.scope} = ${item.ruleSuggestion.value}` : '',
-        ].filter(Boolean).join('\n');
-        row.onmouseenter = () => { row.style.background = C.rowHover; };
-        row.onmouseleave = () => { row.style.background = '#fff'; };
-
-        const status = document.createElement('span');
-        status.textContent = item.kind === 'error' ? '!' : (item.kind === 'key_check' ? '✓' : (item.action === 'block' ? '●' : (item.action === 'hide' ? '◐' : '•')));
-        status.title = item.kind === 'error' ? '错误' : (item.kind === 'key_check' ? 'key 检测' : item.action);
-        status.style.cssText = `width:13px;margin-top:1px;flex-shrink:0;text-align:center;font-size:12px;font-weight:800;color:${color};`;
-        row.appendChild(status);
-
-        const info = document.createElement('div');
-        info.style.cssText = 'flex:1;min-width:0;';
-        const profileUrl = item.handle && !['api_key', ''].includes(item.handle) ? `https://x.com/${encodeURIComponent(item.handle)}` : '';
-        const profileTitle = profileUrl ? `打开 @${item.handle} 主页` : '';
-        let html = `<div class="xfs-name" style="font-size:11px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${profileUrl ? `<a class="xfs-profile-link" href="${profileUrl}" target="_blank" rel="noopener noreferrer" title="${esc(profileTitle)}" style="color:inherit;text-decoration:underline;text-decoration-thickness:1px;text-underline-offset:2px;">${esc(item.displayName || item.handle || item.kind)}</a>` : esc(item.displayName || item.handle || item.kind)}</div>`;
-        html += `<div style="color:${C.sub};font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(item.handle ? `@${item.handle}` : item.source || '')}</div>`;
-        html += `<div style="font-size:9px;color:${color};font-weight:700;">[${esc(item.kind)}] ${esc(item.action)}${item.confidence ? ` · ${Math.round(item.confidence * 100)}%` : ''}</div>`;
-        if (item.reason) {
-          html += `<div style="font-size:9px;color:${C.sub};word-break:break-all;">${esc(item.reason)}</div>`;
-        }
-        if (item.ruleSuggestion?.scope && item.ruleSuggestion?.value) {
-          html += `<div style="font-size:9px;color:${C.regexKw};word-break:break-all;">建议规则: ${esc(item.ruleSuggestion.scope)} = ${esc(item.ruleSuggestion.value)}</div>`;
-        }
-        info.innerHTML = html;
-        row.appendChild(info);
-
-        const actions = document.createElement('div');
-        actions.style.cssText = 'position:absolute;top:4px;right:5px;display:flex;gap:4px;align-items:center;';
-        ['block', 'hide', 'ignore'].forEach(nextLabel => {
-          const b = document.createElement('button');
-          b.type = 'button';
-          b.textContent = nextLabel === 'block' ? '纠正拉黑' : (nextLabel === 'hide' ? '纠正隐藏' : '纠正放行');
-          b.style.cssText = `border:1px solid ${C.btnBorder};background:#fff;color:${nextLabel === 'block' ? C.blockRed : (nextLabel === 'hide' ? C.mute : C.sub)};border-radius:6px;padding:2px 6px;font-size:10px;cursor:pointer;`;
-          b.onclick = () => applyAiWorkLogCorrection(item, nextLabel);
-          actions.appendChild(b);
-        });
-        row.appendChild(actions);
-        wrap.appendChild(row);
-        aiWorkLogList.appendChild(wrap);
-      });
-    }
-    refreshAiWorkLogControlsFn = refreshAiWorkLogControls;
-    aiWorkLogWrap.appendChild(aiWorkLogTitle);
-    aiWorkLogWrap.appendChild(aiWorkLogStatus);
-    aiWorkLogWrap.appendChild(aiWorkLogList);
-    refreshAiWorkLogControls();
 
     function refreshRemoteRulesControls() {
       remoteRulesBtn.textContent = `远程规则订阅：${remoteRulesActive ? '开' : '关'}`;
@@ -7597,7 +7660,6 @@
     grid.appendChild(hideOnlyRulesBtn);
     grid.appendChild(aiReviewWrap);
     grid.appendChild(aiLearningWrap);
-    grid.appendChild(aiWorkLogWrap);
     grid.appendChild(remoteWrap);
     grid.appendChild(youngWrap);
     grid.appendChild(mkToolBtn('两类账号说明', showCategoryHelp));
@@ -8077,6 +8139,7 @@
     document.getElementById('xfs-referral-scan-btn')?.remove();
     document.getElementById('xfs-sweep-btn')?.remove();
     document.getElementById('xfs-queue-btn')?.remove();
+    document.getElementById('xfs-ai-log-btn')?.remove();
     removeGearBtn();
     removeReferralBtn();
     removeHideBtn();
@@ -8126,6 +8189,10 @@
           globalQueuePanelSuppressed = false;
           showGlobalBlockQueueDetailPanel(true);
         }));
+    }
+    if (!document.getElementById('xfs-ai-log-btn')) {
+      document.body.appendChild(mkIconBtn(
+        'xfs-ai-log-btn', 'AI', '打开 AI 工作记录', 360, C.regexKw, showAiWorkLogPanel));
     }
     updateToolbarPositions();
     updateScanButtonsLocked();
@@ -8291,7 +8358,7 @@
     const ids = isListPage(p) ? ['xfs-list-btn']
               : /\/status\/\d/.test(p) ? (buttonsCollapsed
                 ? ['xfs-stack-toggle-btn']
-                : ['xfs-stack-toggle-btn', 'xfs-btn-backdrop', 'xfs-hide-btn', 'xfs-referral-btn', 'xfs-btn', 'xfs-referral-scan-btn', 'xfs-sweep-btn', 'xfs-gear-btn'])
+                : ['xfs-stack-toggle-btn', 'xfs-btn-backdrop', 'xfs-hide-btn', 'xfs-referral-btn', 'xfs-btn', 'xfs-ai-log-btn', 'xfs-referral-scan-btn', 'xfs-sweep-btn', 'xfs-gear-btn'])
               : p === '/home' ? ['xfs-gear-btn'] : [];
     return ids.every(id => document.getElementById(id));
   }
