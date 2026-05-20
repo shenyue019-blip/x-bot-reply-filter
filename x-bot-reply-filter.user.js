@@ -1,4 +1,4 @@
-// ==UserScript==
+﻿// ==UserScript==
 // @name         垃圾推号大扫除 - 自用版
 // @namespace    http://tampermonkey.net/
 // @version      6.17.5
@@ -4775,6 +4775,7 @@
   const GEAR_SVG      = '⚙';  // low-frequency tools: keyword import/export
   const COLLAPSE_SVG  = '-';  // collapse the right-side tool stack
   const EXPAND_SVG    = 'XFS';  // restore the right-side tool stack
+  const QUEUE_SVG     = '隊';  // open global block queue card
 
   // ── Hide helpers ─────────────────────────────────────────────────────
   function applyHideToArticle(art) {
@@ -5461,6 +5462,7 @@
       ['xfs-referral-scan-btn', 240, 0],
       ['xfs-referral-btn', 280, 0],
       ['xfs-sweep-btn', 320, 0],
+      ['xfs-queue-btn', 340, 0],
       ['xfs-btn', 360, 0],
       ['xfs-hide-btn', 400, 0],
       ['xfs-btn-backdrop', 196, -4],
@@ -6862,6 +6864,7 @@
     document.getElementById('xfs-btn')?.remove();
     document.getElementById('xfs-referral-scan-btn')?.remove();
     document.getElementById('xfs-sweep-btn')?.remove();
+    document.getElementById('xfs-queue-btn')?.remove();
     removeGearBtn();
     removeReferralBtn();
     removeHideBtn();
@@ -6903,6 +6906,13 @@
             sweepHasRun = true;
             sweepAll();
           }
+        }));
+    }
+    if (!document.getElementById('xfs-queue-btn')) {
+      document.body.appendChild(mkIconBtn(
+        'xfs-queue-btn', QUEUE_SVG, '打开拉黑排队卡片', 340, C.blockRed, () => {
+          globalQueuePanelSuppressed = false;
+          showGlobalBlockQueueDetailPanel(true);
         }));
     }
     updateToolbarPositions();
