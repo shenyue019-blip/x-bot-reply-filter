@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         垃圾推号大扫除 - 自用版
 // @namespace    http://tampermonkey.net/
-// @version      6.18.2
+// @version      6.18.3
 // @description  扫描推文回复中的垃圾用户批量拉黑
 // @author       summeriscoming
 // @license MIT
@@ -3617,6 +3617,27 @@
     return { ok: true, status: item.status || 'queued' };
   }
 
+  function retryGlobalBlockQueueItem(handle) {
+    const key = normalizeHandle(handle);
+    if (!key) return { ok: false, reason: 'invalid' };
+    const q = readGlobalBlockQueue();
+    const item = q.items[key];
+    if (!item) return { ok: false, reason: 'missing' };
+    if ((item.status || 'queued') === 'running') return { ok: false, reason: 'running' };
+    q.items[key] = {
+      ...item,
+      status: 'queued',
+      error: '',
+      updatedAt: Date.now(),
+    };
+    writeGlobalBlockQueue(q);
+    updateGlobalBlockQueuePanel();
+    refreshGlobalBlockQueueDetailPanel(q);
+    refreshGlobalQueueInlineButtons();
+    maybeStartGlobalBlockQueueWorker();
+    return { ok: true };
+  }
+
   function tryAcquireGlobalBlockQueueLock() {
     const now = Date.now();
     const cur = GM_getValue(GLOBAL_BLOCK_QUEUE_LOCK_KEY, null);
@@ -4831,8 +4852,19 @@
         row.onmouseleave = () => { if (!row.dataset.blocked) row.style.background = ''; };
 
         if (isGlobalQueueView) {
-          const removeBtn = document.createElement('button');
           const running = (user.queueStatus || 'queued') === 'running';
+          const retryBtn = document.createElement('button');
+          retryBtn.type = 'button';
+          retryBtn.textContent = '↻';
+          retryBtn.title = user.queueStatus === 'failed' ? `重新执行 @${user.handle}` : `重试/重新执行 @${user.handle}`;
+          retryBtn.disabled = user.queueStatus !== 'failed';
+          retryBtn.style.cssText = `position:absolute;top:4px;right:23px;z-index:1;width:14px;height:14px;padding:0;border:none;border-radius:999px;background:${user.queueStatus === 'failed' ? 'rgba(15,20,25,0.06)' : 'transparent'};color:${user.queueStatus === 'failed' ? C.sub : 'transparent'};font-size:12px;line-height:1;display:flex;align-items:center;justify-content:center;cursor:${user.queueStatus === 'failed' ? 'pointer' : 'default'};opacity:${user.queueStatus === 'failed' ? '1' : '0'};`;
+          retryBtn.onclick = e => {
+            e.stopPropagation();
+            const result = retryGlobalBlockQueueItem(user.handle);
+            if (!result.ok && result.reason === 'running') showToast(`@${user.handle} 正在执行中，暂时不能重试`, true);
+          };
+          const removeBtn = document.createElement('button');
           removeBtn.type = 'button';
           removeBtn.textContent = '×';
           removeBtn.title = running ? `@${user.handle} 正在执行中，暂时不能移出队列` : `将 @${user.handle} 移出拉黑队列`;
@@ -4843,6 +4875,7 @@
             const result = removeGlobalBlockQueueItem(user.handle);
             if (!result.ok && result.reason === 'running') showToast(`@${user.handle} 正在执行中，暂时不能移出队列`, true);
           };
+          wrap.appendChild(retryBtn);
           wrap.appendChild(removeBtn);
         }
 
