@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         垃圾推号大扫除 - 自用版
 // @namespace    http://tampermonkey.net/
-// @version      6.18.9
+// @version      6.18.11
 // @description  扫描推文回复中的垃圾用户批量拉黑
 // @author       summeriscoming
 // @license MIT
@@ -7324,14 +7324,54 @@
         aiWorkLogList.appendChild(empty);
         return;
       }
+      const logColor = item => {
+        if (item.kind === 'error') return C.blockRed;
+        if (item.kind === 'key_check') return C.regexKw;
+        if (item.kind === 'test') return C.nameKw;
+        if (item.label === 'block') return C.blockRed;
+        if (item.label === 'hide') return C.mute;
+        return C.sub;
+      };
       recent.forEach(item => {
+        const color = logColor(item);
+        const wrap = document.createElement('div');
+        wrap.style.cssText = 'break-inside:avoid;page-break-inside:avoid;position:relative;';
         const row = document.createElement('div');
-        row.style.cssText = `padding:4px 6px;border:1px solid ${C.border};border-radius:6px;background:#fff;font-size:10px;line-height:1.35;word-break:break-word;display:flex;flex-direction:column;gap:4px;`;
-        const text = document.createElement('div');
-        text.textContent = `${item.kind} · ${item.action} · @${item.handle || '-'}${item.displayName ? ` (${item.displayName})` : ''}${item.source ? ` · ${item.source}` : ''}${item.reason ? ` · ${item.reason}` : ''}${item.confidence ? ` · ${Math.round(item.confidence * 100)}%` : ''}`;
-        text.style.cssText = `color:${C.text};`;
+        row.style.cssText = `display:flex;align-items:flex-start;gap:4px;padding:1px 22px 1px 4px;cursor:pointer;border-bottom:1px solid ${C.border};border-left:3px solid ${color};line-height:1.18;background:#fff;`;
+        row.title = [
+          `${item.kind} · ${item.action} · @${item.handle || '-'}`,
+          item.displayName ? `昵称: ${item.displayName}` : '',
+          item.source ? `来源: ${item.source}` : '',
+          item.reason ? `原因: ${item.reason}` : '',
+          item.ruleSuggestion ? `建议: ${item.ruleSuggestion.scope} = ${item.ruleSuggestion.value}` : '',
+        ].filter(Boolean).join('\n');
+        row.onmouseenter = () => { row.style.background = C.rowHover; };
+        row.onmouseleave = () => { row.style.background = '#fff'; };
+
+        const status = document.createElement('span');
+        status.textContent = item.kind === 'error' ? '!' : (item.kind === 'key_check' ? '✓' : (item.action === 'block' ? '●' : (item.action === 'hide' ? '◐' : '•')));
+        status.title = item.kind === 'error' ? '错误' : (item.kind === 'key_check' ? 'key 检测' : item.action);
+        status.style.cssText = `width:13px;margin-top:1px;flex-shrink:0;text-align:center;font-size:12px;font-weight:800;color:${color};`;
+        row.appendChild(status);
+
+        const info = document.createElement('div');
+        info.style.cssText = 'flex:1;min-width:0;';
+        const profileUrl = item.handle && !['api_key', ''].includes(item.handle) ? `https://x.com/${encodeURIComponent(item.handle)}` : '';
+        const profileTitle = profileUrl ? `打开 @${item.handle} 主页` : '';
+        let html = `<div class="xfs-name" style="font-size:11px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${profileUrl ? `<a class="xfs-profile-link" href="${profileUrl}" target="_blank" rel="noopener noreferrer" title="${esc(profileTitle)}" style="color:inherit;text-decoration:underline;text-decoration-thickness:1px;text-underline-offset:2px;">${esc(item.displayName || item.handle || item.kind)}</a>` : esc(item.displayName || item.handle || item.kind)}</div>`;
+        html += `<div style="color:${C.sub};font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(item.handle ? `@${item.handle}` : item.source || '')}</div>`;
+        html += `<div style="font-size:9px;color:${color};font-weight:700;">[${esc(item.kind)}] ${esc(item.action)}${item.confidence ? ` · ${Math.round(item.confidence * 100)}%` : ''}</div>`;
+        if (item.reason) {
+          html += `<div style="font-size:9px;color:${C.sub};word-break:break-all;">${esc(item.reason)}</div>`;
+        }
+        if (item.ruleSuggestion?.scope && item.ruleSuggestion?.value) {
+          html += `<div style="font-size:9px;color:${C.regexKw};word-break:break-all;">建议规则: ${esc(item.ruleSuggestion.scope)} = ${esc(item.ruleSuggestion.value)}</div>`;
+        }
+        info.innerHTML = html;
+        row.appendChild(info);
+
         const actions = document.createElement('div');
-        actions.style.cssText = 'display:flex;gap:4px;flex-wrap:wrap;';
+        actions.style.cssText = 'position:absolute;top:4px;right:5px;display:flex;gap:4px;align-items:center;';
         ['block', 'hide', 'ignore'].forEach(nextLabel => {
           const b = document.createElement('button');
           b.type = 'button';
@@ -7340,9 +7380,9 @@
           b.onclick = () => applyAiWorkLogCorrection(item, nextLabel);
           actions.appendChild(b);
         });
-        row.appendChild(text);
         row.appendChild(actions);
-        aiWorkLogList.appendChild(row);
+        wrap.appendChild(row);
+        aiWorkLogList.appendChild(wrap);
       });
     }
     refreshAiWorkLogControlsFn = refreshAiWorkLogControls;
@@ -7579,15 +7619,6 @@
     p.appendChild(toolsFtr);
 
     document.body.appendChild(p);
-
-    setTimeout(() => {
-      const onDown = e => {
-        if (p.contains(e.target) || e.target?.closest?.('#xfs-gear-btn, #xfs-queue-btn, #xfs-global-block-queue, #xfs-panel[data-xfs-global-queue-view="1"]')) return;
-        closeToolsPanel();
-        document.removeEventListener('mousedown', onDown, true);
-      };
-      document.addEventListener('mousedown', onDown, true);
-    }, 0);
   }
 
   function injectGearBtn() {
