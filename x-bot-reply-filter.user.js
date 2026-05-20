@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         垃圾推号大扫除
 // @namespace    http://tampermonkey.net/
-// @version      6.17
+// @version      6.17.1
 // @description  扫描推文回复中的垃圾用户批量拉黑
 // @author       summeriscoming
 // @license MIT
@@ -558,6 +558,7 @@
   const GLOBAL_BLOCK_QUEUE_LONG_COOLDOWN_JITTER = 60 * 1000;
   const GLOBAL_BLOCK_QUEUE_PANEL_W = 136;
   const RESULT_PANEL_POS_KEY = 'xfs_result_panel_position_v1';
+  const RESULT_PANEL_SIZE_KEY = 'xfs_result_panel_size_v1';
   const RESULT_PANEL_DOCK_POS_KEY = 'xfs_result_panel_dock_position_v1';
   // Low-follower hiding is intentionally disabled for now. It produced more
   // false positives than profile-link based referral detection, but the old
@@ -3361,6 +3362,22 @@
     });
   }
 
+  function readFloatingPanelSize(key, fallback) {
+    const raw = GM_getValue(key, null);
+    if (!raw || typeof raw !== 'object') return fallback;
+    return {
+      width: Math.max(280, Number(raw.width) || fallback.width),
+      height: Math.max(220, Number(raw.height) || fallback.height),
+    };
+  }
+
+  function writeFloatingPanelSize(key, size) {
+    GM_setValue(key, {
+      width: Math.max(280, Math.round(Number(size.width) || 0)),
+      height: Math.max(220, Math.round(Number(size.height) || 0)),
+    });
+  }
+
   function clampFloatingPanelPosition(pos, width, height) {
     return {
       left: Math.min(Math.max(0, Number(pos.left) || 0), Math.max(0, window.innerWidth - width - 8)),
@@ -3449,10 +3466,19 @@
       : Math.min(3, Math.max(2, Math.ceil(ordered.length / rowsPerCol)));
     const COL_W = 260;
     const panelW = colsNeeded * COL_W;
+    const panelDefaultH = Math.min(Math.max(360, window.innerHeight - 110), Math.max(260, window.innerHeight - 16));
+    const freeSize = isGlobalQueueView
+      ? readFloatingPanelSize(RESULT_PANEL_SIZE_KEY, {
+        width: Math.min(Math.max(520, panelW), Math.max(360, window.innerWidth - 24)),
+        height: panelDefaultH,
+      })
+      : null;
+    const initialPanelW = freeSize ? Math.min(freeSize.width, Math.max(360, window.innerWidth - 16)) : panelW;
+    const initialPanelH = freeSize ? Math.min(freeSize.height, Math.max(260, window.innerHeight - 16)) : 220;
     const panelPos = clampFloatingPanelPosition(
       readFloatingPanelPosition(RESULT_PANEL_POS_KEY, { left: 0, top: 53 }),
-      panelW,
-      220
+      initialPanelW,
+      initialPanelH
     );
 
     // Panel — flush left edge, adaptive width, semi-transparent
@@ -3461,14 +3487,19 @@
     if (isGlobalQueueView) panel.dataset.xfsGlobalQueueView = '1';
     panel.style.cssText = [
       'position:fixed', `left:${panelPos.left}px`, `top:${panelPos.top}px`,
-      `width:${panelW}px`, `height:calc(100vh - ${panelPos.top}px)`,
+      `width:${initialPanelW}px`, isGlobalQueueView ? `height:${initialPanelH}px` : `height:calc(100vh - ${panelPos.top}px)`,
       'background:rgba(255,255,255,0.93)',
       'backdrop-filter:blur(6px)',
       '-webkit-backdrop-filter:blur(6px)',
-      `border-right:1px solid ${C.border}`,
-      'border-radius:0 10px 10px 0',
-      'box-shadow:4px 0 24px rgba(0,0,0,0.14)',
+      isGlobalQueueView ? `border:1px solid ${C.border}` : `border-right:1px solid ${C.border}`,
+      isGlobalQueueView ? 'border-radius:10px' : 'border-radius:0 10px 10px 0',
+      isGlobalQueueView ? 'box-shadow:0 8px 28px rgba(0,0,0,0.16)' : 'box-shadow:4px 0 24px rgba(0,0,0,0.14)',
       'display:flex', 'flex-direction:column', 'overflow:hidden',
+      isGlobalQueueView ? 'resize:both' : '',
+      isGlobalQueueView ? 'min-width:360px' : '',
+      isGlobalQueueView ? 'min-height:260px' : '',
+      isGlobalQueueView ? 'max-width:calc(100vw - 16px)' : '',
+      isGlobalQueueView ? 'max-height:calc(100vh - 16px)' : '',
       `font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif`,
       `font-size:12px`, `color:${C.text}`,
       'z-index:2147483646',
@@ -3478,10 +3509,18 @@
     const hdr = document.createElement('div');
     hdr.style.cssText = `padding:6px 12px;border-bottom:1px solid ${C.border};display:flex;align-items:center;gap:8px;flex-shrink:0;`;
     makeDraggableFloatingPanel(panel, hdr, RESULT_PANEL_POS_KEY, {
-      width: () => panelW,
-      height: () => 220,
-      onMove: pos => { panel.style.height = `calc(100vh - ${pos.top}px)`; },
-      onEnd: () => requestAnimationFrame(updateGlobalBlockQueuePanel),
+      width: () => panel.offsetWidth || initialPanelW,
+      height: () => panel.offsetHeight || initialPanelH,
+      onMove: pos => {
+        if (!isGlobalQueueView) panel.style.height = `calc(100vh - ${pos.top}px)`;
+      },
+      onEnd: () => {
+        if (isGlobalQueueView) writeFloatingPanelSize(RESULT_PANEL_SIZE_KEY, {
+          width: panel.offsetWidth,
+          height: panel.offsetHeight,
+        });
+        requestAnimationFrame(updateGlobalBlockQueuePanel);
+      },
     });
 
     const title = document.createElement('span');
@@ -4344,6 +4383,29 @@
     panel.appendChild(rateNote);
     panel.appendChild(scriptFtr);
     document.body.appendChild(panel);
+    const syncColumnHeight = () => {
+      colContainer.style.height = `${Math.max(0, body.clientHeight)}px`;
+    };
+    let resizeSaveTimer = null;
+    let panelResizeObserver = null;
+    if (isGlobalQueueView && typeof ResizeObserver !== 'undefined') {
+      panelResizeObserver = new ResizeObserver(() => {
+        syncColumnHeight();
+        clearTimeout(resizeSaveTimer);
+        resizeSaveTimer = setTimeout(() => {
+          writeFloatingPanelSize(RESULT_PANEL_SIZE_KEY, {
+            width: panel.offsetWidth,
+            height: panel.offsetHeight,
+          });
+          writeFloatingPanelPosition(RESULT_PANEL_POS_KEY, {
+            left: panel.offsetLeft,
+            top: panel.offsetTop,
+          });
+          requestAnimationFrame(updateGlobalBlockQueuePanel);
+        }, 180);
+      });
+      panelResizeObserver.observe(panel);
+    }
     requestAnimationFrame(updateGlobalBlockQueuePanel);
 
     // Escape key closes panel
@@ -4356,6 +4418,8 @@
       dockCaption = null;
       dockRestoreBtn = null;
       dockRefreshBtn = null;
+      if (panelResizeObserver) panelResizeObserver.disconnect();
+      clearTimeout(resizeSaveTimer);
       document.removeEventListener('keydown', onEsc);
       if (isGlobalQueueView) updateGlobalBlockQueuePanel();
     };
@@ -4366,7 +4430,7 @@
     // Set colContainer to the measured pixel height so column-fill:auto works.
     // Must happen after panel is in DOM so clientHeight is non-zero.
     requestAnimationFrame(() => {
-      colContainer.style.height = body.clientHeight + 'px';
+      syncColumnHeight();
       if (panelDockedActive) {
         kwBar.style.display = 'none';
         kwToggle.textContent = '关键词';
