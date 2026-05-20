@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         垃圾推号大扫除 - 自用版
 // @namespace    http://tampermonkey.net/
-// @version      6.18.7
+// @version      6.18.8
 // @description  扫描推文回复中的垃圾用户批量拉黑
 // @author       summeriscoming
 // @license MIT
@@ -15,6 +15,7 @@
 // @connect      x.com
 // @connect      raw.githubusercontent.com
 // @connect      api.github.com
+// @connect      api.openai.com
 // @run-at       document-start
 // @downloadURL https://raw.githubusercontent.com/shenyue019-blip/x-bot-reply-filter/main/x-bot-reply-filter.user.js
 // @updateURL https://raw.githubusercontent.com/shenyue019-blip/x-bot-reply-filter/main/x-bot-reply-filter.user.js
@@ -1663,6 +1664,17 @@
             showToast(`AI复核：@${handle} 已隐藏`, false);
           }
         } catch (e) {
+          recordAiWorkLog({
+            kind: 'error',
+            label: 'ignore',
+            action: 'ignore',
+            handle,
+            displayName: item.displayName,
+            source: item.source,
+            reason: e?.message || String(e || 'AI review failed'),
+            confidence: 0,
+            fingerprint: `${aiReviewFingerprint(item)}:error:${String(e?.message || e || 'failed')}`,
+          });
           console.warn(`[XFS] AI review failed @${handle}:`, e);
         } finally {
           aiReviewPending.delete(handle);
@@ -7443,7 +7455,7 @@
 
     setTimeout(() => {
       const onDown = e => {
-        if (p.contains(e.target) || e.target?.id === 'xfs-gear-btn') return;
+        if (p.contains(e.target) || e.target?.closest?.('#xfs-gear-btn, #xfs-queue-btn, #xfs-global-block-queue')) return;
         closeToolsPanel();
         document.removeEventListener('mousedown', onDown, true);
       };
