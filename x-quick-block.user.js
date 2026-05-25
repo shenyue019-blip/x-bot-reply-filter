@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X 快捷屏蔽按钮
 // @namespace    https://github.com/shenyue019-blip/x-bot-reply-filter
-// @version      1.2.0
+// @version      1.2.1
 // @description  在 X/Twitter 评论区给每条回复加一个快捷屏蔽按钮，先入队再按节奏屏蔽，并在页面边缘保留可撤销队列
 // @author       summeriscoming
 // @license      MIT
@@ -929,11 +929,12 @@
     if (!nameEl) return '';
     for (const span of nameEl.querySelectorAll('span')) {
       const txt = textOf(span);
-      if (/^@[A-Za-z0-9_]{1,15}$/.test(txt)) return displayHandle(txt);
+      if (txt.startsWith('@') && txt.length > 1 && !txt.includes(' ')) return displayHandle(txt.slice(1));
     }
     for (const link of nameEl.querySelectorAll('a[href]')) {
-      const path = new URL(link.href, location.href).pathname.split('/').filter(Boolean);
-      if (path.length === 1 && /^[A-Za-z0-9_]{1,15}$/.test(path[0])) return displayHandle(path[0]);
+      const href = link.getAttribute('href') || '';
+      const m = href.match(/^\/([A-Za-z0-9_]{1,15})(?:$|[/?#])/);
+      if (m && !['i', 'search'].includes(m[1].toLowerCase())) return displayHandle(m[1]);
     }
     return '';
   }
