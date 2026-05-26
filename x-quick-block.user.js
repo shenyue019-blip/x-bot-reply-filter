@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X 快捷屏蔽按钮
 // @namespace    https://github.com/shenyue019-blip/x-bot-reply-filter
-// @version      1.2.5
+// @version      1.2.6
 // @description  在 X/Twitter 评论区给每条回复加一个快捷屏蔽按钮，先入队再按节奏屏蔽，并在页面边缘保留可撤销队列
 // @author       summeriscoming
 // @license      MIT
@@ -25,7 +25,7 @@
   'use strict';
 
   const SCRIPT_ID = 'xqb';
-  const SCRIPT_VERSION = '1.2.5';
+  const SCRIPT_VERSION = '1.2.6';
   const QUEUE_KEY = 'xqb_block_queue_v1';
   const TIMING_KEY = 'xqb_queue_timing_v1';
   const WORKER_LOCK_KEY = 'xqb_queue_worker_lock_v1';
@@ -647,7 +647,14 @@
         display: flex;
         flex-direction: column;
       }
-      #xqb-panel[data-collapsed="1"] { width: 44px; min-height: 0; height: auto; }
+      #xqb-panel[data-collapsed="1"] {
+        width: 38px !important;
+        height: 38px !important;
+        min-width: 38px !important;
+        min-height: 38px !important;
+        border-radius: 999px;
+        overflow: hidden;
+      }
       #xqb-panel button {
         font: inherit;
         border-radius: 7px;
@@ -799,8 +806,25 @@
       .xqb-action:disabled { opacity: .45; cursor: wait; }
       #xqb-panel[data-collapsed="1"] .xqb-title,
       #xqb-panel[data-collapsed="1"] .xqb-body,
-      #xqb-panel[data-collapsed="1"] .xqb-clear { display: none; }
-      #xqb-panel[data-collapsed="1"] .xqb-head { justify-content: center; padding: 7px; border-bottom: 0; }
+      #xqb-panel[data-collapsed="1"] .xqb-clear,
+      #xqb-panel[data-collapsed="1"] .xqb-resizer { display: none; }
+      #xqb-panel[data-collapsed="1"] .xqb-head {
+        width: 38px;
+        height: 38px;
+        justify-content: center;
+        padding: 0;
+        border-bottom: 0;
+        cursor: pointer;
+      }
+      #xqb-panel[data-collapsed="1"] .xqb-icon-btn {
+        width: 38px;
+        height: 38px;
+        border: 0;
+        border-radius: 999px;
+        background: #fff;
+        color: #f4212e;
+        font-size: 15px;
+      }
     `;
     (document.head || document.documentElement).appendChild(style);
   }
@@ -962,8 +986,8 @@
     panel.dataset.collapsed = collapsed ? '1' : '0';
     applyPanelGeometry(panel);
     if (collapsed) {
-      panel.style.width = '44px';
-      panel.style.removeProperty('height');
+      panel.style.width = '38px';
+      panel.style.height = '38px';
     }
     panel.replaceChildren();
 
