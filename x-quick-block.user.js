@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X 快捷屏蔽按钮
 // @namespace    https://github.com/shenyue019-blip/x-bot-reply-filter
-// @version      1.2.2
+// @version      1.2.3
 // @description  在 X/Twitter 评论区给每条回复加一个快捷屏蔽按钮，先入队再按节奏屏蔽，并在页面边缘保留可撤销队列
 // @author       summeriscoming
 // @license      MIT
@@ -51,6 +51,10 @@
   const cancelRequestedHandles = new Set();
   const inFlightBlockRequests = new Map();
 
+  function mountRoot() {
+    return document.body || document.documentElement;
+  }
+
   function normalizeHandle(value) {
     const m = String(value || '').trim().replace(/^@+/, '').match(/[A-Za-z0-9_]{1,15}/);
     return m ? m[0].toLowerCase() : '';
@@ -91,8 +95,32 @@
       'max-width:320px',
       'pointer-events:none',
     ].join(';');
-    document.documentElement.appendChild(el);
+    mountRoot().appendChild(el);
     window.setTimeout(() => el.remove(), 2400);
+  }
+
+  function bootBadge() {
+    document.getElementById(`${SCRIPT_ID}-boot`)?.remove();
+    const el = document.createElement('div');
+    el.id = `${SCRIPT_ID}-boot`;
+    el.textContent = 'X 快捷屏蔽 1.2.3 已运行';
+    el.style.cssText = [
+      'position:fixed',
+      'left:12px',
+      'bottom:12px',
+      'z-index:2147483647',
+      'background:#00ba7c',
+      'color:#fff',
+      'font-size:12px',
+      'font-weight:800',
+      'line-height:1.3',
+      'padding:7px 10px',
+      'border-radius:8px',
+      'box-shadow:0 8px 24px rgba(0,0,0,.18)',
+      'pointer-events:none',
+    ].join(';');
+    mountRoot().appendChild(el);
+    window.setTimeout(() => el.remove(), 5000);
   }
 
   function normalizeHeaderObject(headers) {
@@ -686,7 +714,7 @@
       #xqb-panel[data-collapsed="1"] .xqb-clear { display: none; }
       #xqb-panel[data-collapsed="1"] .xqb-head { justify-content: center; padding: 7px; border-bottom: 0; }
     `;
-    document.documentElement.appendChild(style);
+    (document.head || document.documentElement).appendChild(style);
   }
 
   function ensurePanel() {
@@ -696,7 +724,7 @@
     panel = document.createElement('div');
     panel.id = `${SCRIPT_ID}-panel`;
     panel.addEventListener('click', onPanelClick);
-    document.documentElement.appendChild(panel);
+    mountRoot().appendChild(panel);
     return panel;
   }
 
@@ -1160,6 +1188,7 @@
 
   function start() {
     ensureStyles();
+    bootBadge();
     renderPanel();
 
     if (typeof GM_addValueChangeListener === 'function') {
