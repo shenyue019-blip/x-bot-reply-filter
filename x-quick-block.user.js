@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X 快捷屏蔽按钮
 // @namespace    https://github.com/shenyue019-blip/x-bot-reply-filter
-// @version      1.2.8
+// @version      1.2.9
 // @description  在 X/Twitter 评论区给每条回复加一个快捷屏蔽按钮，先入队再按节奏屏蔽，并在页面边缘保留可撤销队列
 // @author       summeriscoming
 // @license      MIT
@@ -25,7 +25,7 @@
   'use strict';
 
   const SCRIPT_ID = 'xqb';
-  const SCRIPT_VERSION = '1.2.8';
+  const SCRIPT_VERSION = '1.2.9';
   const QUEUE_KEY = 'xqb_block_queue_v1';
   const TIMING_KEY = 'xqb_queue_timing_v1';
   const WORKER_LOCK_KEY = 'xqb_queue_worker_lock_v1';
@@ -50,6 +50,7 @@
   let workerActive = false;
   let workerWakeTimer = null;
   let lastScanStats = { candidates: 0, handles: 0, buttons: 0 };
+  let collapsedPanelDraggedAt = 0;
   const busyHandles = new Set();
   const cancelRequestedHandles = new Set();
   const inFlightBlockRequests = new Map();
@@ -853,18 +854,23 @@
 
   function makePanelDraggable(panel, handle) {
     handle.onpointerdown = event => {
-      if (event.button !== 0 || event.target.closest('button')) return;
+      const collapsed = panel.dataset.collapsed === '1';
+      if (event.button !== 0 || (!collapsed && event.target.closest('button'))) return;
       event.preventDefault();
       const rect = panel.getBoundingClientRect();
       const startX = event.clientX;
       const startY = event.clientY;
       const startLeft = rect.left;
       const startTop = rect.top;
+      let moved = false;
       const maxLeft = () => Math.max(8, window.innerWidth - 52);
       const maxTop = () => Math.max(8, window.innerHeight - 52);
       const move = ev => {
-        const left = Math.max(8, Math.min(maxLeft(), startLeft + ev.clientX - startX));
-        const top = Math.max(8, Math.min(maxTop(), startTop + ev.clientY - startY));
+        const dx = ev.clientX - startX;
+        const dy = ev.clientY - startY;
+        if (Math.abs(dx) + Math.abs(dy) > 4) moved = true;
+        const left = Math.max(8, Math.min(maxLeft(), startLeft + dx));
+        const top = Math.max(8, Math.min(maxTop(), startTop + dy));
         panel.style.left = `${Math.round(left)}px`;
         panel.style.top = `${Math.round(top)}px`;
         panel.style.right = 'auto';
@@ -873,6 +879,7 @@
         document.removeEventListener('pointermove', move, true);
         document.removeEventListener('pointerup', up, true);
         savePanelPosition(panel);
+        if (collapsed && moved) collapsedPanelDraggedAt = Date.now();
       };
       document.addEventListener('pointermove', move, true);
       document.addEventListener('pointerup', up, true);
@@ -1074,6 +1081,7 @@
   async function onPanelClick(event) {
     const panel = event.target.closest(`#${SCRIPT_ID}-panel`);
     if (panel?.dataset.collapsed === '1') {
+      if (Date.now() - collapsedPanelDraggedAt < 250) return;
       event.preventDefault();
       event.stopPropagation();
       GM_setValue(PANEL_COLLAPSED_KEY, false);
