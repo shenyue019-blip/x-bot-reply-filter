@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X 快捷屏蔽按钮
 // @namespace    https://github.com/shenyue019-blip/x-bot-reply-filter
-// @version      1.2.4
+// @version      1.2.5
 // @description  在 X/Twitter 评论区给每条回复加一个快捷屏蔽按钮，先入队再按节奏屏蔽，并在页面边缘保留可撤销队列
 // @author       summeriscoming
 // @license      MIT
@@ -25,11 +25,13 @@
   'use strict';
 
   const SCRIPT_ID = 'xqb';
-  const SCRIPT_VERSION = '1.2.4';
+  const SCRIPT_VERSION = '1.2.5';
   const QUEUE_KEY = 'xqb_block_queue_v1';
   const TIMING_KEY = 'xqb_queue_timing_v1';
   const WORKER_LOCK_KEY = 'xqb_queue_worker_lock_v1';
   const PANEL_COLLAPSED_KEY = 'xqb_panel_collapsed_v1';
+  const PANEL_POS_KEY = 'xqb_panel_position_v1';
+  const PANEL_SIZE_KEY = 'xqb_panel_size_v1';
   const MAX_QUEUE_ITEMS = 50;
   const BLOCK_GAP_MS = 15 * 1000;
   const TWENTY_COOLDOWN_EVERY = 20;
@@ -67,7 +69,26 @@
   }
 
   function textOf(node) {
-    return String(node?.textContent || '').replace(/\s+/g, ' ').trim();
+    if (!node) return '';
+    const parts = [];
+    const walk = document.createTreeWalker(node, NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT);
+    let current = walk.currentNode;
+    while (current) {
+      if (current.nodeType === Node.TEXT_NODE) {
+        parts.push(current.nodeValue || '');
+      } else if (current.nodeType === Node.ELEMENT_NODE) {
+        const el = current;
+        const tag = String(el.tagName || '').toLowerCase();
+        if (tag === 'img') {
+          const alt = el.getAttribute('alt');
+          if (alt) parts.push(alt);
+        } else if (tag === 'br') {
+          parts.push('\n');
+        }
+      }
+      current = walk.nextNode();
+    }
+    return parts.join('').replace(/[ \t\f\v]+/g, ' ').replace(/\s*\n\s*/g, '\n').trim();
   }
 
   function getCookie(name) {
@@ -529,6 +550,51 @@
     }
   }
 
+  function panelStoredSize() {
+    const raw = GM_getValue(PANEL_SIZE_KEY, null);
+    const defaultHeight = Math.max(260, Math.min(520, window.innerHeight - 72));
+    const width = Math.max(260, Math.min(window.innerWidth - 16, Number(raw?.width || 286) || 286));
+    const height = Math.max(260, Math.min(window.innerHeight - 24, Number(raw?.height || defaultHeight) || defaultHeight));
+    return { width, height };
+  }
+
+  function panelStoredPosition(size = panelStoredSize()) {
+    const raw = GM_getValue(PANEL_POS_KEY, null);
+    const defaultLeft = Math.max(8, window.innerWidth - size.width - 12);
+    const defaultTop = 56;
+    const left = Math.max(8, Math.min(window.innerWidth - 52, Number(raw?.left ?? defaultLeft)));
+    const top = Math.max(8, Math.min(window.innerHeight - 52, Number(raw?.top ?? defaultTop)));
+    return { left, top };
+  }
+
+  function applyPanelGeometry(panel) {
+    if (!panel) return;
+    const size = panelStoredSize();
+    const pos = panelStoredPosition(size);
+    panel.style.left = `${pos.left}px`;
+    panel.style.top = `${pos.top}px`;
+    panel.style.right = 'auto';
+    panel.style.width = `${size.width}px`;
+    if (size.height) panel.style.height = `${size.height}px`;
+    else panel.style.removeProperty('height');
+  }
+
+  function savePanelPosition(panel) {
+    const rect = panel.getBoundingClientRect();
+    GM_setValue(PANEL_POS_KEY, {
+      left: Math.round(Math.max(8, Math.min(window.innerWidth - 52, rect.left))),
+      top: Math.round(Math.max(8, Math.min(window.innerHeight - 52, rect.top))),
+    });
+  }
+
+  function savePanelSize(panel) {
+    const rect = panel.getBoundingClientRect();
+    GM_setValue(PANEL_SIZE_KEY, {
+      width: Math.round(Math.max(260, Math.min(window.innerWidth - 16, rect.width))),
+      height: Math.round(Math.max(220, Math.min(window.innerHeight - 24, rect.height))),
+    });
+  }
+
   function ensureStyles() {
     if (document.getElementById(`${SCRIPT_ID}-style`)) return;
     const style = document.createElement('style');
@@ -563,11 +629,14 @@
       #xqb-panel, #xqb-panel * { box-sizing: border-box; }
       #xqb-panel {
         position: fixed;
-        top: 96px;
+        top: 56px;
         right: 12px;
         z-index: 2147483646;
         width: 286px;
+        min-width: 260px;
+        min-height: 220px;
         max-width: calc(100vw - 24px);
+        max-height: calc(100vh - 16px);
         color: #0f1419;
         background: rgba(255,255,255,.98);
         border: 1px solid rgba(15,20,25,.14);
@@ -575,8 +644,10 @@
         box-shadow: 0 10px 34px rgba(0,0,0,.16);
         font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
         overflow: hidden;
+        display: flex;
+        flex-direction: column;
       }
-      #xqb-panel[data-collapsed="1"] { width: 44px; }
+      #xqb-panel[data-collapsed="1"] { width: 44px; min-height: 0; height: auto; }
       #xqb-panel button {
         font: inherit;
         border-radius: 7px;
@@ -589,6 +660,8 @@
         padding: 8px;
         border-bottom: 1px solid rgba(15,20,25,.1);
         background: #fff;
+        cursor: move;
+        user-select: none;
       }
       .xqb-title {
         flex: 1;
@@ -610,9 +683,19 @@
         font-weight: 900;
       }
       .xqb-body {
-        max-height: 420px;
+        flex: 1;
+        min-height: 0;
         overflow: auto;
         padding: 6px;
+      }
+      .xqb-resizer {
+        position: absolute;
+        right: 0;
+        bottom: 0;
+        width: 16px;
+        height: 16px;
+        cursor: nwse-resize;
+        background: linear-gradient(135deg, transparent 48%, rgba(83,100,113,.45) 50%, rgba(83,100,113,.45) 58%, transparent 60%);
       }
       .xqb-status-line {
         margin: 0 0 6px;
@@ -730,7 +813,63 @@
     panel.id = `${SCRIPT_ID}-panel`;
     panel.addEventListener('click', onPanelClick);
     mountRoot().appendChild(panel);
+    applyPanelGeometry(panel);
     return panel;
+  }
+
+  function makePanelDraggable(panel, handle) {
+    handle.onpointerdown = event => {
+      if (event.button !== 0 || event.target.closest('button')) return;
+      event.preventDefault();
+      const rect = panel.getBoundingClientRect();
+      const startX = event.clientX;
+      const startY = event.clientY;
+      const startLeft = rect.left;
+      const startTop = rect.top;
+      const maxLeft = () => Math.max(8, window.innerWidth - 52);
+      const maxTop = () => Math.max(8, window.innerHeight - 52);
+      const move = ev => {
+        const left = Math.max(8, Math.min(maxLeft(), startLeft + ev.clientX - startX));
+        const top = Math.max(8, Math.min(maxTop(), startTop + ev.clientY - startY));
+        panel.style.left = `${Math.round(left)}px`;
+        panel.style.top = `${Math.round(top)}px`;
+        panel.style.right = 'auto';
+      };
+      const up = () => {
+        document.removeEventListener('pointermove', move, true);
+        document.removeEventListener('pointerup', up, true);
+        savePanelPosition(panel);
+      };
+      document.addEventListener('pointermove', move, true);
+      document.addEventListener('pointerup', up, true);
+    };
+  }
+
+  function makePanelResizable(panel, grip) {
+    grip.onpointerdown = event => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const rect = panel.getBoundingClientRect();
+      const startX = event.clientX;
+      const startY = event.clientY;
+      const startWidth = rect.width;
+      const startHeight = rect.height;
+      const move = ev => {
+        const width = Math.max(260, Math.min(window.innerWidth - rect.left - 8, startWidth + ev.clientX - startX));
+        const height = Math.max(220, Math.min(window.innerHeight - rect.top - 8, startHeight + ev.clientY - startY));
+        panel.style.width = `${Math.round(width)}px`;
+        panel.style.height = `${Math.round(height)}px`;
+      };
+      const up = () => {
+        document.removeEventListener('pointermove', move, true);
+        document.removeEventListener('pointerup', up, true);
+        savePanelSize(panel);
+        savePanelPosition(panel);
+      };
+      document.addEventListener('pointermove', move, true);
+      document.addEventListener('pointerup', up, true);
+    };
   }
 
   function makeAvatarNode(item) {
@@ -821,6 +960,11 @@
     const counts = queueCounts(queue);
     const activeCount = counts.queued + counts.blocking;
     panel.dataset.collapsed = collapsed ? '1' : '0';
+    applyPanelGeometry(panel);
+    if (collapsed) {
+      panel.style.width = '44px';
+      panel.style.removeProperty('height');
+    }
     panel.replaceChildren();
 
     const head = document.createElement('div');
@@ -843,6 +987,7 @@
     collapse.textContent = collapsed ? '禁' : '-';
     head.append(title, clear, collapse);
     panel.appendChild(head);
+    makePanelDraggable(panel, head);
 
     if (collapsed) return;
 
@@ -862,6 +1007,11 @@
     renderQueueSection(body, '已屏蔽', blockedItems);
 
     panel.appendChild(body);
+    const resizer = document.createElement('div');
+    resizer.className = 'xqb-resizer';
+    resizer.title = '拖动调整大小';
+    panel.appendChild(resizer);
+    makePanelResizable(panel, resizer);
   }
 
   function panelTitleText(counts = queueCounts()) {
