@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X 快捷屏蔽按钮
 // @namespace    https://github.com/shenyue019-blip/x-bot-reply-filter
-// @version      1.2.9
+// @version      1.3.0
 // @description  在 X/Twitter 评论区给每条回复加一个快捷屏蔽按钮，先入队再按节奏屏蔽，并在页面边缘保留可撤销队列
 // @author       summeriscoming
 // @license      MIT
@@ -25,7 +25,7 @@
   'use strict';
 
   const SCRIPT_ID = 'xqb';
-  const SCRIPT_VERSION = '1.2.9';
+  const SCRIPT_VERSION = '1.3.0';
   const QUEUE_KEY = 'xqb_block_queue_v1';
   const TIMING_KEY = 'xqb_queue_timing_v1';
   const WORKER_LOCK_KEY = 'xqb_queue_worker_lock_v1';
@@ -386,10 +386,12 @@
   function ensureInitialQueueDelay(resetCount = false) {
     const timing = readTiming();
     const now = Date.now();
+    const preservedNextRunAt = Math.max(Number(timing.nextRunAt || 0), now);
+    const waitingForPreviousBlock = Number(timing.nextRunAt || 0) > now;
     writeTiming({
       count: resetCount ? 0 : timing.count,
-      nextRunAt: resetCount ? now : Math.max(timing.nextRunAt || 0, now),
-      reason: resetCount ? '第一个立即执行' : (timing.reason || '相邻两次屏蔽间隔 15 秒'),
+      nextRunAt: preservedNextRunAt,
+      reason: waitingForPreviousBlock ? (timing.reason || '相邻两次屏蔽间隔 15 秒') : '可立即执行',
     });
   }
 
@@ -525,7 +527,6 @@
       workerActive = false;
       releaseWorkerLock();
       const queue = readQueue();
-      if (!hasActiveQueue(queue)) writeTiming({ ...readTiming(), nextRunAt: 0, reason: '' });
       renderPanel(queue);
       setTimeout(() => {
         if (readQueue().items.some(item => item.status === 'queued')) maybeStartQueueWorker();
