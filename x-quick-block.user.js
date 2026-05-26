@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X 快捷屏蔽按钮
 // @namespace    https://github.com/shenyue019-blip/x-bot-reply-filter
-// @version      1.2.3
+// @version      1.2.4
 // @description  在 X/Twitter 评论区给每条回复加一个快捷屏蔽按钮，先入队再按节奏屏蔽，并在页面边缘保留可撤销队列
 // @author       summeriscoming
 // @license      MIT
@@ -25,6 +25,7 @@
   'use strict';
 
   const SCRIPT_ID = 'xqb';
+  const SCRIPT_VERSION = '1.2.4';
   const QUEUE_KEY = 'xqb_block_queue_v1';
   const TIMING_KEY = 'xqb_queue_timing_v1';
   const WORKER_LOCK_KEY = 'xqb_queue_worker_lock_v1';
@@ -103,7 +104,7 @@
     document.getElementById(`${SCRIPT_ID}-boot`)?.remove();
     const el = document.createElement('div');
     el.id = `${SCRIPT_ID}-boot`;
-    el.textContent = 'X 快捷屏蔽 1.2.3 已运行';
+    el.textContent = `X 快捷屏蔽 ${SCRIPT_VERSION} 已运行`;
     el.style.cssText = [
       'position:fixed',
       'left:12px',
@@ -365,8 +366,8 @@
     const now = Date.now();
     writeTiming({
       count: resetCount ? 0 : timing.count,
-      nextRunAt: Math.max(timing.nextRunAt || 0, now + BLOCK_GAP_MS),
-      reason: '每个账号间隔 15 秒',
+      nextRunAt: resetCount ? now : Math.max(timing.nextRunAt || 0, now),
+      reason: resetCount ? '第一个立即执行' : (timing.reason || '相邻两次屏蔽间隔 15 秒'),
     });
   }
 
@@ -469,6 +470,7 @@
           if (cancelRequestedHandles.has(next.key) || !getQueueItem(next.key)) {
             try { await unblockUser(next.handle); } catch (_) {}
             cancelRequestedHandles.delete(next.key);
+            clearQueuedHiddenArticles(next.handle);
             clearArticlesBlocked(next.handle);
             setButtonsForHandle(next.handle, 'idle');
             continue;
@@ -483,11 +485,13 @@
         } catch (err) {
           if (cancelRequestedHandles.has(next.key) || !getQueueItem(next.key)) {
             cancelRequestedHandles.delete(next.key);
+            clearQueuedHiddenArticles(next.handle);
             setButtonsForHandle(next.handle, 'idle');
             continue;
           }
           writeTiming({ ...readTiming(), nextRunAt: Date.now() + BLOCK_GAP_MS, reason: '失败后暂停 15 秒' });
           upsertQueueItem(next.handle, { displayName: next.displayName, avatarUrl: next.avatarUrl, comment: next.comment, status: 'failed', error: err?.message || String(err) });
+          clearQueuedHiddenArticles(next.handle);
           setButtonsForHandle(next.handle, 'idle');
           toast(`屏蔽 @${next.handle} 失败：${err?.message || err}`, true);
           if (/ct0|HTTP 401|HTTP 403|HTTP 419|登录|auth/i.test(String(err?.message || err))) break;
@@ -553,7 +557,8 @@
       .xqb-btn[data-xqb-state="blocking"],
       .xqb-btn[data-xqb-state="unblocking"] { opacity: .45 !important; cursor: wait !important; }
       .xqb-btn[data-xqb-state="blocked"] { border-color: #536471 !important; color: #536471 !important; background: rgba(83, 100, 113, .12) !important; }
-      article[data-xqb-blocked="1"] { opacity: .38 !important; transition: opacity .18s ease !important; }
+      article[data-xqb-local-hidden="1"],
+      article[data-xqb-blocked="1"] { display: none !important; }
       article[data-xqb-blocked="1"] [data-testid="User-Name"] a { text-decoration: line-through !important; }
       #xqb-panel, #xqb-panel * { box-sizing: border-box; }
       #xqb-panel {
@@ -929,6 +934,7 @@
       try { inFlightBlockRequests.get(key)?.abort?.(); } catch (_) {}
     }
     removeQueueItem(key);
+    clearQueuedHiddenArticles(item.handle);
     clearArticlesBlocked(item.handle);
     setButtonsForHandle(item.handle, 'idle');
     toast(`已撤回 @${item.handle}`);
@@ -1018,19 +1024,67 @@
     return String(img?.src || '').slice(0, 500);
   }
 
-  function extractCommentFromArticle(article) {
+  function cleanCommentText(value) {
+    return String(value || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function isUsableCommentText(value, handle = '', displayName = '') {
+    const text = cleanCommentText(value);
+    if (!text) return false;
+    if (text.length < 2) return false;
+    const lower = text.toLowerCase();
+    const key = normalizeHandle(handle);
+    if (key && lower === `@${key}`) return false;
+    if (displayName && lower === cleanCommentText(displayName).toLowerCase()) return false;
+    if (/^(reply|repost|like|view|share|回复|转帖|喜欢|查看|分享|广告)$/i.test(text)) return false;
+    return true;
+  }
+
+  function bestCommentCandidate(candidates, handle = '', displayName = '') {
+    const seen = new Set();
+    const usable = [];
+    for (const raw of candidates) {
+      const text = cleanCommentText(raw);
+      const norm = text.toLowerCase();
+      if (!isUsableCommentText(text, handle, displayName) || seen.has(norm)) continue;
+      seen.add(norm);
+      usable.push(text);
+    }
+    usable.sort((a, b) => b.length - a.length);
+    return (usable[0] || '').slice(0, 280);
+  }
+
+  function extractCommentFromArticle(article, handle = '', displayName = '') {
+    const candidates = [];
     const textEl = article.querySelector('[data-testid="tweetText"]');
-    if (textEl) return textOf(textEl).slice(0, 280);
-    const langEl = article.querySelector('[lang]');
-    if (langEl && !langEl.closest('[data-testid="User-Name"]')) return textOf(langEl).slice(0, 280);
-    return '';
+    if (textEl) candidates.push(textOf(textEl));
+
+    article.querySelectorAll('[lang]').forEach(node => {
+      if (node.closest('[data-testid="User-Name"], [role="button"]')) return;
+      candidates.push(textOf(node));
+    });
+
+    article.querySelectorAll('div[dir="auto"], span[dir="auto"]').forEach(node => {
+      if (node.closest('[data-testid="User-Name"], [role="button"]')) return;
+      if (node.closest('time')) return;
+      candidates.push(textOf(node));
+    });
+
+    const rawLines = String(article.innerText || article.textContent || '')
+      .split(/\n+/)
+      .map(cleanCommentText)
+      .filter(Boolean);
+    candidates.push(...rawLines);
+
+    return bestCommentCandidate(candidates, handle, displayName) || '无文本评论或媒体回复';
   }
 
   function queuePatchFromArticle(article, handle, displayName = '') {
+    const name = displayName || extractDisplayNameFromArticle(article, handle);
     return {
-      displayName: displayName || extractDisplayNameFromArticle(article, handle),
+      displayName: name,
       avatarUrl: extractAvatarFromArticle(article),
-      comment: extractCommentFromArticle(article),
+      comment: extractCommentFromArticle(article, handle, name),
     };
   }
 
@@ -1130,16 +1184,42 @@
     return normalizeHandle(extractHandleFromArticle(article)) === normalizeHandle(handle);
   }
 
+  function hideQueuedArticle(handle, article) {
+    if (!article) return;
+    article.dataset.xqbQueued = '1';
+    article.dataset.xqbQueuedHandle = normalizeHandle(handle);
+    article.dataset.xqbLocalHidden = '1';
+  }
+
+  function clearQueuedHiddenArticles(handle) {
+    const key = normalizeHandle(handle);
+    tweetArticles().forEach(article => {
+      if (article.dataset.xqbQueuedHandle === key || articleHasHandle(article, handle)) {
+        delete article.dataset.xqbQueued;
+        delete article.dataset.xqbQueuedHandle;
+        delete article.dataset.xqbLocalHidden;
+      }
+    });
+  }
+
   function markArticlesBlocked(handle) {
     tweetArticles().forEach(article => {
-      if (articleHasHandle(article, handle)) article.dataset.xqbBlocked = '1';
+      if (!articleHasHandle(article, handle)) return;
+      delete article.dataset.xqbQueued;
+      delete article.dataset.xqbQueuedHandle;
+      delete article.dataset.xqbLocalHidden;
+      article.dataset.xqbBlocked = '1';
     });
     setButtonsForHandle(handle, 'blocked');
   }
 
   function clearArticlesBlocked(handle) {
     tweetArticles().forEach(article => {
-      if (articleHasHandle(article, handle)) delete article.dataset.xqbBlocked;
+      if (!articleHasHandle(article, handle)) return;
+      delete article.dataset.xqbBlocked;
+      delete article.dataset.xqbLocalHidden;
+      delete article.dataset.xqbQueued;
+      delete article.dataset.xqbQueuedHandle;
     });
     setButtonsForHandle(handle, 'idle');
   }
@@ -1159,7 +1239,7 @@
     const meta = sourceArticle ? queuePatchFromArticle(sourceArticle, handle, displayName) : { displayName };
     upsertQueueItem(handle, { ...meta, status: 'queued', error: '' });
     setButtonsForHandle(handle, 'queued');
-    if (sourceArticle) sourceArticle.dataset.xqbQueued = '1';
+    hideQueuedArticle(handle, sourceArticle);
     renderPanel();
     maybeStartQueueWorker();
     toast(`@${handle} 已加入屏蔽队列`);
