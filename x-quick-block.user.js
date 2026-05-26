@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X 快捷屏蔽按钮
 // @namespace    https://github.com/shenyue019-blip/x-bot-reply-filter
-// @version      1.3.1
+// @version      1.3.2
 // @description  在 X/Twitter 评论区给每条回复加一个快捷屏蔽按钮，先入队再按节奏屏蔽，并在页面边缘保留可撤销队列
 // @author       summeriscoming
 // @license      MIT
@@ -25,7 +25,7 @@
   'use strict';
 
   const SCRIPT_ID = 'xqb';
-  const SCRIPT_VERSION = '1.3.1';
+  const SCRIPT_VERSION = '1.3.2';
   const QUEUE_KEY = 'xqb_block_queue_v1';
   const TIMING_KEY = 'xqb_queue_timing_v1';
   const WORKER_LOCK_KEY = 'xqb_queue_worker_lock_v1';
@@ -606,19 +606,19 @@
         display: inline-flex !important;
         align-items: center !important;
         justify-content: center !important;
-        width: 20px !important;
-        height: 20px !important;
-        margin: 0 4px !important;
+        width: 18px !important;
+        height: 18px !important;
+        margin: 0 !important;
         padding: 0 !important;
         border: 1.5px solid #f4212e !important;
         border-radius: 999px !important;
         background: rgba(244, 33, 46, .08) !important;
         color: #f4212e !important;
-        font: 800 11px/1 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif !important;
+        font: 800 10px/1 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif !important;
         cursor: pointer !important;
         box-sizing: border-box !important;
         flex: 0 0 auto !important;
-        z-index: 10 !important;
+        z-index: 20 !important;
         transition: transform .12s ease, opacity .12s ease, background .12s ease !important;
       }
       .xqb-btn:hover { transform: scale(1.12) !important; background: rgba(244, 33, 46, .16) !important; }
@@ -1350,18 +1350,13 @@
         enqueueBlock(handle, displayName, article);
       }, true);
 
-      const caret = findActionAnchor(article);
-      if (caret) {
-        caret.insertAdjacentElement('beforebegin', btn);
-      } else {
-        article.style.position = 'relative';
-        Object.assign(btn.style, {
-          position: 'absolute',
-          top: '10px',
-          right: '44px',
-        });
-        article.appendChild(btn);
-      }
+      article.style.position = 'relative';
+      Object.assign(btn.style, {
+        position: 'absolute',
+        top: '12px',
+        right: '72px',
+      });
+      article.appendChild(btn);
 
       syncArticleQueueState(article, handle);
     });
