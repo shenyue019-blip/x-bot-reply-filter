@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X 快捷屏蔽按钮
 // @namespace    https://github.com/shenyue019-blip/x-bot-reply-filter
-// @version      1.3.0
+// @version      1.3.1
 // @description  在 X/Twitter 评论区给每条回复加一个快捷屏蔽按钮，先入队再按节奏屏蔽，并在页面边缘保留可撤销队列
 // @author       summeriscoming
 // @license      MIT
@@ -25,7 +25,7 @@
   'use strict';
 
   const SCRIPT_ID = 'xqb';
-  const SCRIPT_VERSION = '1.3.0';
+  const SCRIPT_VERSION = '1.3.1';
   const QUEUE_KEY = 'xqb_block_queue_v1';
   const TIMING_KEY = 'xqb_queue_timing_v1';
   const WORKER_LOCK_KEY = 'xqb_queue_worker_lock_v1';
@@ -1336,7 +1336,7 @@
       btn.setAttribute('aria-label', `快捷屏蔽 @${handle}`);
 
       const item = getQueueItem(key);
-      setButtonState(btn, ['queued', 'blocking', 'blocked'].includes(item?.status) ? item.status : 'idle');
+      setButtonState(btn, isHiddenQueueStatus(item?.status) ? item.status : 'idle');
 
       btn.addEventListener('click', event => {
         event.preventDefault();
@@ -1363,7 +1363,7 @@
         article.appendChild(btn);
       }
 
-      if (item?.status === 'blocked') markArticlesBlocked(handle);
+      syncArticleQueueState(article, handle);
     });
     lastScanStats = {
       candidates: articles.length,
@@ -1384,6 +1384,27 @@
 
   function articleHasHandle(article, handle) {
     return normalizeHandle(extractHandleFromArticle(article)) === normalizeHandle(handle);
+  }
+
+  function isHiddenQueueStatus(status) {
+    return ['queued', 'blocking', 'blocked'].includes(status || '');
+  }
+
+  function syncArticleQueueState(article, handle = extractHandleFromArticle(article)) {
+    if (!article || !handle) return;
+    const item = getQueueItem(handle);
+    delete article.dataset.xqbBlocked;
+    delete article.dataset.xqbLocalHidden;
+    delete article.dataset.xqbQueued;
+    delete article.dataset.xqbQueuedHandle;
+    if (item?.status === 'blocked') {
+      article.dataset.xqbBlocked = '1';
+    } else if (['queued', 'blocking'].includes(item?.status)) {
+      article.dataset.xqbQueued = '1';
+      article.dataset.xqbQueuedHandle = normalizeHandle(handle);
+      article.dataset.xqbLocalHidden = '1';
+    }
+    setButtonsForHandle(handle, isHiddenQueueStatus(item?.status) ? item.status : 'idle');
   }
 
   function hideQueuedArticle(handle, article) {
@@ -1478,10 +1499,7 @@
         renderPanel();
         tweetArticles().forEach(article => {
           const handle = extractHandleFromArticle(article);
-          const item = handle ? getQueueItem(handle) : null;
-          if (item?.status === 'blocked') article.dataset.xqbBlocked = '1';
-          else delete article.dataset.xqbBlocked;
-          if (handle) setButtonsForHandle(handle, ['queued', 'blocking', 'blocked'].includes(item?.status) ? item.status : 'idle');
+          if (handle) syncArticleQueueState(article, handle);
         });
         maybeStartQueueWorker();
       });
