@@ -1,14 +1,14 @@
 // ==UserScript==
 // @name         X 快捷屏蔽按钮
 // @namespace    https://github.com/shenyue019-blip/x-bot-reply-filter
-// @version      1.2.1
+// @version      1.2.2
 // @description  在 X/Twitter 评论区给每条回复加一个快捷屏蔽按钮，先入队再按节奏屏蔽，并在页面边缘保留可撤销队列
 // @author       summeriscoming
 // @license      MIT
 // @match        https://x.com/*
+// @match        https://*.x.com/*
 // @match        https://twitter.com/*
-// @match        https://mobile.x.com/*
-// @match        https://mobile.twitter.com/*
+// @match        https://*.twitter.com/*
 // @grant        unsafeWindow
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -46,6 +46,7 @@
   let scanQueued = false;
   let workerActive = false;
   let workerWakeTimer = null;
+  let lastScanStats = { candidates: 0, handles: 0, buttons: 0 };
   const busyHandles = new Set();
   const cancelRequestedHandles = new Set();
   const inFlightBlockRequests = new Map();
@@ -792,8 +793,9 @@
     const head = document.createElement('div');
     head.className = 'xqb-head';
     const title = document.createElement('div');
+    title.id = `${SCRIPT_ID}-panel-title`;
     title.className = 'xqb-title';
-    title.textContent = `快捷屏蔽 排${counts.queued + counts.blocking} · 已${counts.blocked + counts.unblocking}`;
+    title.textContent = panelTitleText(counts);
     const clear = document.createElement('button');
     clear.type = 'button';
     clear.className = 'xqb-icon-btn xqb-clear';
@@ -827,6 +829,15 @@
     renderQueueSection(body, '已屏蔽', blockedItems);
 
     panel.appendChild(body);
+  }
+
+  function panelTitleText(counts = queueCounts()) {
+    return `快捷屏蔽 排${counts.queued + counts.blocking} · 已${counts.blocked + counts.unblocking} · 文${lastScanStats.candidates}/钮${lastScanStats.buttons}`;
+  }
+
+  function updatePanelTitle() {
+    const title = document.getElementById(`${SCRIPT_ID}-panel-title`);
+    if (title) title.textContent = panelTitleText();
   }
 
   function actionButton(action, label, kind, key, disabled, title) {
@@ -924,17 +935,35 @@
     });
   }
 
+  function handleFromHref(href) {
+    try {
+      const path = new URL(href, location.href).pathname.split('/').filter(Boolean);
+      const first = path[0] || '';
+      if (!/^[A-Za-z0-9_]{1,15}$/.test(first)) return '';
+      if (['i', 'search', 'home', 'explore', 'notifications', 'messages', 'settings'].includes(first.toLowerCase())) return '';
+      return displayHandle(first);
+    } catch (_) {
+      const m = String(href || '').match(/(?:^|https?:\/\/(?:mobile\.)?(?:x|twitter)\.com\/)([A-Za-z0-9_]{1,15})(?:$|[/?#])/);
+      if (!m || ['i', 'search', 'home', 'explore', 'notifications', 'messages', 'settings'].includes(m[1].toLowerCase())) return '';
+      return displayHandle(m[1]);
+    }
+  }
+
   function extractHandleFromArticle(article) {
     const nameEl = article.querySelector('[data-testid="User-Name"]');
-    if (!nameEl) return '';
-    for (const span of nameEl.querySelectorAll('span')) {
-      const txt = textOf(span);
-      if (txt.startsWith('@') && txt.length > 1 && !txt.includes(' ')) return displayHandle(txt.slice(1));
+    if (nameEl) {
+      for (const span of nameEl.querySelectorAll('span')) {
+        const txt = textOf(span);
+        if (txt.startsWith('@') && txt.length > 1 && !txt.includes(' ')) return displayHandle(txt.slice(1));
+      }
+      for (const link of nameEl.querySelectorAll('a[href]')) {
+        const handle = handleFromHref(link.getAttribute('href') || link.href || '');
+        if (handle) return handle;
+      }
     }
-    for (const link of nameEl.querySelectorAll('a[href]')) {
-      const href = link.getAttribute('href') || '';
-      const m = href.match(/^\/([A-Za-z0-9_]{1,15})(?:$|[/?#])/);
-      if (m && !['i', 'search'].includes(m[1].toLowerCase())) return displayHandle(m[1]);
+    for (const link of article.querySelectorAll('a[href]')) {
+      const handle = handleFromHref(link.getAttribute('href') || link.href || '');
+      if (handle) return handle;
     }
     return '';
   }
@@ -983,20 +1012,34 @@
 
   function isLikelyMainStatusArticle(article) {
     if (!isStatusPage()) return false;
-    const first = document.querySelector('main article[data-testid="tweet"]');
+    const first = document.querySelector('main article[data-testid="tweet"], main article[role="article"]');
     return first === article;
+  }
+
+  function tweetArticles() {
+    return Array.from(document.querySelectorAll('article[data-testid="tweet"], article[role="article"], [data-testid="cellInnerDiv"] article'))
+      .filter((article, index, arr) => article && arr.indexOf(article) === index);
+  }
+
+  function findActionAnchor(article) {
+    const node = article.querySelector('[data-testid="caret"], button[aria-label="More"], button[aria-label="更多"], div[aria-label="More"][role="button"], div[aria-label="更多"][role="button"]');
+    return node?.closest?.('button,[role="button"]') || node;
   }
 
   function injectButtons() {
     if (!document.body) return;
     ensureStyles();
 
-    document.querySelectorAll('article[data-testid="tweet"]:not([data-xqb-seen])').forEach(article => {
-      article.dataset.xqbSeen = '1';
+    const articles = tweetArticles();
+    let handles = 0;
+    articles.forEach(article => {
+      if (article.querySelector('.xqb-btn')) return;
       if (isLikelyMainStatusArticle(article)) return;
 
       const handle = extractHandleFromArticle(article);
       if (!handle) return;
+      handles += 1;
+      article.dataset.xqbButtoned = '1';
       const key = normalizeHandle(handle);
       const displayName = extractDisplayNameFromArticle(article, handle);
 
@@ -1023,7 +1066,7 @@
         enqueueBlock(handle, displayName, article);
       }, true);
 
-      const caret = article.querySelector('[data-testid="caret"]');
+      const caret = findActionAnchor(article);
       if (caret) {
         caret.insertAdjacentElement('beforebegin', btn);
       } else {
@@ -1038,6 +1081,12 @@
 
       if (item?.status === 'blocked') markArticlesBlocked(handle);
     });
+    lastScanStats = {
+      candidates: articles.length,
+      handles,
+      buttons: document.querySelectorAll('.xqb-btn[data-xqb-handle]').length,
+    };
+    updatePanelTitle();
   }
 
   function scheduleScan() {
@@ -1054,14 +1103,14 @@
   }
 
   function markArticlesBlocked(handle) {
-    document.querySelectorAll('article[data-testid="tweet"]').forEach(article => {
+    tweetArticles().forEach(article => {
       if (articleHasHandle(article, handle)) article.dataset.xqbBlocked = '1';
     });
     setButtonsForHandle(handle, 'blocked');
   }
 
   function clearArticlesBlocked(handle) {
-    document.querySelectorAll('article[data-testid="tweet"]').forEach(article => {
+    tweetArticles().forEach(article => {
       if (articleHasHandle(article, handle)) delete article.dataset.xqbBlocked;
     });
     setButtonsForHandle(handle, 'idle');
@@ -1116,7 +1165,7 @@
     if (typeof GM_addValueChangeListener === 'function') {
       GM_addValueChangeListener(QUEUE_KEY, () => {
         renderPanel();
-        document.querySelectorAll('article[data-testid="tweet"]').forEach(article => {
+        tweetArticles().forEach(article => {
           const handle = extractHandleFromArticle(article);
           const item = handle ? getQueueItem(handle) : null;
           if (item?.status === 'blocked') article.dataset.xqbBlocked = '1';
