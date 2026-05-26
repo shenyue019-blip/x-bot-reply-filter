@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X 快捷屏蔽按钮
 // @namespace    https://github.com/shenyue019-blip/x-bot-reply-filter
-// @version      1.2.7
+// @version      1.2.8
 // @description  在 X/Twitter 评论区给每条回复加一个快捷屏蔽按钮，先入队再按节奏屏蔽，并在页面边缘保留可撤销队列
 // @author       summeriscoming
 // @license      MIT
@@ -25,7 +25,7 @@
   'use strict';
 
   const SCRIPT_ID = 'xqb';
-  const SCRIPT_VERSION = '1.2.7';
+  const SCRIPT_VERSION = '1.2.8';
   const QUEUE_KEY = 'xqb_block_queue_v1';
   const TIMING_KEY = 'xqb_queue_timing_v1';
   const WORKER_LOCK_KEY = 'xqb_queue_worker_lock_v1';
@@ -812,7 +812,7 @@
       #xqb-panel[data-collapsed="1"] .xqb-title,
       #xqb-panel[data-collapsed="1"] .xqb-body,
       #xqb-panel[data-collapsed="1"] .xqb-clear,
-      #xqb-panel[data-collapsed="1"] .xqb-resizer { display: none; }
+      #xqb-panel[data-collapsed="1"] .xqb-resizer { display: none !important; }
       #xqb-panel[data-collapsed="1"] .xqb-head {
         width: 38px;
         height: 38px;
@@ -1019,7 +1019,8 @@
     collapse.dataset.action = 'collapse';
     collapse.title = collapsed ? '展开快捷屏蔽队列' : '收起快捷屏蔽队列';
     collapse.textContent = collapsed ? '禁' : '-';
-    head.append(title, clear, collapse);
+    if (collapsed) head.appendChild(collapse);
+    else head.append(title, clear, collapse);
     panel.appendChild(head);
     makePanelDraggable(panel, head);
 
@@ -1071,6 +1072,14 @@
   }
 
   async function onPanelClick(event) {
+    const panel = event.target.closest(`#${SCRIPT_ID}-panel`);
+    if (panel?.dataset.collapsed === '1') {
+      event.preventDefault();
+      event.stopPropagation();
+      GM_setValue(PANEL_COLLAPSED_KEY, false);
+      renderPanel();
+      return;
+    }
     const btn = event.target.closest('button[data-action]');
     if (!btn) return;
     event.preventDefault();
