@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X 快捷屏蔽按钮
 // @namespace    https://github.com/shenyue019-blip/x-bot-reply-filter
-// @version      1.2.6
+// @version      1.2.7
 // @description  在 X/Twitter 评论区给每条回复加一个快捷屏蔽按钮，先入队再按节奏屏蔽，并在页面边缘保留可撤销队列
 // @author       summeriscoming
 // @license      MIT
@@ -25,7 +25,7 @@
   'use strict';
 
   const SCRIPT_ID = 'xqb';
-  const SCRIPT_VERSION = '1.2.6';
+  const SCRIPT_VERSION = '1.2.7';
   const QUEUE_KEY = 'xqb_block_queue_v1';
   const TIMING_KEY = 'xqb_queue_timing_v1';
   const WORKER_LOCK_KEY = 'xqb_queue_worker_lock_v1';
@@ -688,6 +688,11 @@
         color: #536471;
         font-size: 13px;
         font-weight: 900;
+        line-height: 1;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        text-align: center;
       }
       .xqb-body {
         flex: 1;
@@ -819,11 +824,16 @@
       #xqb-panel[data-collapsed="1"] .xqb-icon-btn {
         width: 38px;
         height: 38px;
+        padding: 0;
         border: 0;
         border-radius: 999px;
         background: #fff;
         color: #f4212e;
         font-size: 15px;
+        line-height: 1;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
       }
     `;
     (document.head || document.documentElement).appendChild(style);
