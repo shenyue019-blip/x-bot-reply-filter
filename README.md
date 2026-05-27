@@ -17,6 +17,6 @@ https://raw.githubusercontent.com/shenyue019-blip/x-bot-reply-filter/main/x-bot-
 ## Notes
 
 - Filtering and logs run locally in the browser.
-- The quick block script adds a small `禁` button to reply tweets, hides the clicked reply immediately, rate-limits blocking to no more than 10 per rolling 30 minutes, 20 per rolling hour, and 100 per rolling 24 hours, and shows draggable/resizable pending/blocking and blocked queues with avatar, username, emoji-safe comment text, and undo controls.
+- The quick block script adds a small `禁` button to reply tweets, hides the clicked reply immediately, keeps at least 3 minutes between successful blocks, rate-limits blocking to no more than 10 per rolling 30 minutes, 20 per rolling hour, and 100 per rolling 24 hours, and shows draggable/resizable pending/blocking and blocked queues with avatar, username, emoji-safe comment text, and undo controls.
 - Auto block uses the current X web login session and runs through the review queue with configurable delays.
 - False positive cards can whitelist a user and attempt to unblock them.

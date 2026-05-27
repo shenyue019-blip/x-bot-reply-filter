@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X 快捷屏蔽按钮
 // @namespace    https://github.com/shenyue019-blip/x-bot-reply-filter
-// @version      1.3.3
+// @version      1.3.4
 // @description  在 X/Twitter 评论区给每条回复加一个快捷屏蔽按钮，先入队再按节奏屏蔽，并在页面边缘保留可撤销队列
 // @author       summeriscoming
 // @license      MIT
@@ -25,7 +25,7 @@
   'use strict';
 
   const SCRIPT_ID = 'xqb';
-  const SCRIPT_VERSION = '1.3.3';
+  const SCRIPT_VERSION = '1.3.4';
   const QUEUE_KEY = 'xqb_block_queue_v1';
   const TIMING_KEY = 'xqb_queue_timing_v1';
   const WORKER_LOCK_KEY = 'xqb_queue_worker_lock_v1';
@@ -38,6 +38,7 @@
   const HALF_HOUR_WINDOW_MS = 30 * 60 * 1000;
   const HOUR_WINDOW_MS = 60 * 60 * 1000;
   const DAY_WINDOW_MS = 24 * 60 * 60 * 1000;
+  const MIN_BLOCK_GAP_MS = HALF_HOUR_WINDOW_MS / 10;
   const RATE_LIMIT_HISTORY_MAX = 120;
   const RATE_LIMITS = [
     { label: '30 分钟窗口', limit: 10, windowMs: HALF_HOUR_WINDOW_MS },
@@ -382,6 +383,15 @@
     const history = normalizeBlockHistory(timing.history, now);
     let nextRunAt = 0;
     let reason = '';
+
+    const lastBlockAt = history[history.length - 1] || 0;
+    if (lastBlockAt > 0) {
+      const gapUnlockAt = lastBlockAt + MIN_BLOCK_GAP_MS + RATE_LIMIT_GRACE_MS;
+      if (gapUnlockAt > nextRunAt) {
+        nextRunAt = gapUnlockAt;
+        reason = '相邻屏蔽间隔 3 分钟';
+      }
+    }
 
     for (const rule of RATE_LIMITS) {
       const recent = history.filter(ts => ts > now - rule.windowMs);
