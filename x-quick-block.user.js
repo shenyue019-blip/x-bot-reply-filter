@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X 快捷屏蔽按钮
 // @namespace    https://github.com/shenyue019-blip/x-bot-reply-filter
-// @version      1.3.2
+// @version      1.3.3
 // @description  在 X/Twitter 评论区给每条回复加一个快捷屏蔽按钮，先入队再按节奏屏蔽，并在页面边缘保留可撤销队列
 // @author       summeriscoming
 // @license      MIT
@@ -25,19 +25,25 @@
   'use strict';
 
   const SCRIPT_ID = 'xqb';
-  const SCRIPT_VERSION = '1.3.2';
+  const SCRIPT_VERSION = '1.3.3';
   const QUEUE_KEY = 'xqb_block_queue_v1';
   const TIMING_KEY = 'xqb_queue_timing_v1';
   const WORKER_LOCK_KEY = 'xqb_queue_worker_lock_v1';
   const PANEL_COLLAPSED_KEY = 'xqb_panel_collapsed_v1';
   const PANEL_POS_KEY = 'xqb_panel_position_v1';
   const PANEL_SIZE_KEY = 'xqb_panel_size_v1';
-  const MAX_QUEUE_ITEMS = 50;
-  const BLOCK_GAP_MS = 15 * 1000;
-  const TWENTY_COOLDOWN_EVERY = 20;
-  const TWENTY_COOLDOWN_MS = 30 * 1000;
-  const SIXTY_COOLDOWN_EVERY = 60;
-  const SIXTY_COOLDOWN_MS = 5 * 60 * 1000;
+  const MAX_QUEUE_ITEMS = 120;
+  const FAILURE_COOLDOWN_MS = 15 * 1000;
+  const RATE_LIMIT_GRACE_MS = 1000;
+  const HALF_HOUR_WINDOW_MS = 30 * 60 * 1000;
+  const HOUR_WINDOW_MS = 60 * 60 * 1000;
+  const DAY_WINDOW_MS = 24 * 60 * 60 * 1000;
+  const RATE_LIMIT_HISTORY_MAX = 120;
+  const RATE_LIMITS = [
+    { label: '30 分钟窗口', limit: 10, windowMs: HALF_HOUR_WINDOW_MS },
+    { label: '1 小时窗口', limit: 20, windowMs: HOUR_WINDOW_MS },
+    { label: '24 小时窗口', limit: 100, windowMs: DAY_WINDOW_MS },
+  ];
   const LOCK_TTL_MS = 25 * 1000;
   const STALE_RUNNING_MS = 2 * 60 * 1000;
   const BUTTON_TEXT = '禁';
@@ -329,25 +335,38 @@
   }
 
   function emptyTiming() {
-    return { version: 1, count: 0, nextRunAt: 0, reason: '' };
+    return { version: 2, count: 0, nextRunAt: 0, reason: '', history: [] };
+  }
+
+  function normalizeBlockHistory(value, now = Date.now()) {
+    const cutoff = now - DAY_WINDOW_MS;
+    return (Array.isArray(value) ? value : [])
+      .map(Number)
+      .filter(ts => Number.isFinite(ts) && ts > cutoff && ts <= now + RATE_LIMIT_GRACE_MS)
+      .sort((a, b) => a - b)
+      .slice(-RATE_LIMIT_HISTORY_MAX);
   }
 
   function readTiming() {
     const raw = GM_getValue(TIMING_KEY, emptyTiming());
+    const history = normalizeBlockHistory(raw?.history);
     return {
-      version: 1,
-      count: Math.max(0, Number(raw?.count || 0) || 0),
+      version: 2,
+      count: history.length,
       nextRunAt: Math.max(0, Number(raw?.nextRunAt || 0) || 0),
-      reason: String(raw?.reason || '').slice(0, 80),
+      reason: String(raw?.reason || '').slice(0, 120),
+      history,
     };
   }
 
   function writeTiming(timing) {
+    const history = normalizeBlockHistory(timing?.history);
     GM_setValue(TIMING_KEY, {
-      version: 1,
-      count: Math.max(0, Number(timing?.count || 0) || 0),
+      version: 2,
+      count: history.length,
       nextRunAt: Math.max(0, Number(timing?.nextRunAt || 0) || 0),
-      reason: String(timing?.reason || '').slice(0, 80),
+      reason: String(timing?.reason || '').slice(0, 120),
+      history,
     });
   }
 
@@ -359,47 +378,87 @@
     return counts;
   }
 
-  function hasActiveQueue(queue = readQueue()) {
-    return queue.items.some(item => item.status === 'queued' || item.status === 'blocking');
+  function rateLimitState(now = Date.now(), timing = readTiming()) {
+    const history = normalizeBlockHistory(timing.history, now);
+    let nextRunAt = 0;
+    let reason = '';
+
+    for (const rule of RATE_LIMITS) {
+      const recent = history.filter(ts => ts > now - rule.windowMs);
+      if (recent.length < rule.limit) continue;
+      const unlockAt = recent[recent.length - rule.limit] + rule.windowMs + RATE_LIMIT_GRACE_MS;
+      if (unlockAt > nextRunAt) {
+        nextRunAt = unlockAt;
+        reason = `${rule.label}已满 ${recent.length}/${rule.limit}`;
+      }
+    }
+
+    return {
+      history,
+      nextRunAt,
+      reason: nextRunAt > now ? reason : '可立即执行',
+    };
   }
 
-  function nextDelayForCompletedCount(count) {
-    if (count > 0 && count % SIXTY_COOLDOWN_EVERY === 0) {
-      return { ms: SIXTY_COOLDOWN_MS, reason: '每 60 个冷却 5 分钟' };
+  function refreshRateLimitTiming(extra = {}) {
+    const now = Date.now();
+    const timing = readTiming();
+    const state = rateLimitState(now, timing);
+    const storedNextRunAt = Number(timing.nextRunAt || 0) > now ? Math.max(0, Number(timing.nextRunAt || 0) || 0) : 0;
+    const extraNextRunAt = Math.max(0, Number(extra.nextRunAt || 0) || 0);
+    let nextRunAt = state.nextRunAt;
+    let reason = state.reason;
+    if (storedNextRunAt > nextRunAt) {
+      nextRunAt = storedNextRunAt;
+      reason = timing.reason || state.reason;
     }
-    if (count > 0 && count % TWENTY_COOLDOWN_EVERY === 0) {
-      return { ms: TWENTY_COOLDOWN_MS, reason: '每 20 个冷却 30 秒' };
+    if (extraNextRunAt > nextRunAt) {
+      nextRunAt = extraNextRunAt;
+      reason = String(extra.reason || state.reason);
     }
-    return { ms: BLOCK_GAP_MS, reason: '每个账号间隔 15 秒' };
+    const next = {
+      history: state.history,
+      nextRunAt,
+      reason: nextRunAt > now ? reason : '可立即执行',
+    };
+    writeTiming(next);
+    return next;
+  }
+
+  function recordSuccessfulBlock() {
+    const now = Date.now();
+    const timing = readTiming();
+    const history = normalizeBlockHistory([...timing.history, now], now);
+    const state = rateLimitState(now, { history });
+    writeTiming(state);
+    return state;
   }
 
   function formatDuration(ms) {
     const sec = Math.max(0, Math.ceil(Number(ms || 0) / 1000));
+    if (sec >= 86400) {
+      const days = Math.floor(sec / 86400);
+      const hours = Math.floor((sec % 86400) / 3600);
+      return hours ? `${days}天${hours}小时` : `${days}天`;
+    }
+    if (sec >= 3600) {
+      const hours = Math.floor(sec / 3600);
+      const min = Math.floor((sec % 3600) / 60);
+      return min ? `${hours}小时${min}分钟` : `${hours}小时`;
+    }
     if (sec >= 60) {
       const min = Math.floor(sec / 60);
       const rest = sec % 60;
-      return rest ? `${min}分${rest}秒` : `${min}分`;
+      return rest ? `${min}分钟${rest}秒` : `${min}分钟`;
     }
     return `${sec}秒`;
   }
 
-  function ensureInitialQueueDelay(resetCount = false) {
-    const timing = readTiming();
-    const now = Date.now();
-    const preservedNextRunAt = Math.max(Number(timing.nextRunAt || 0), now);
-    const waitingForPreviousBlock = Number(timing.nextRunAt || 0) > now;
-    writeTiming({
-      count: resetCount ? 0 : timing.count,
-      nextRunAt: preservedNextRunAt,
-      reason: waitingForPreviousBlock ? (timing.reason || '相邻两次屏蔽间隔 15 秒') : '可立即执行',
-    });
-  }
-
   function queueDelayText() {
-    const timing = readTiming();
+    const timing = refreshRateLimitTiming();
     const remaining = Number(timing.nextRunAt || 0) - Date.now();
     if (remaining <= 0) return '';
-    return `${formatDuration(remaining)}后执行 · ${timing.reason || '队列间隔'}`;
+    return `${formatDuration(remaining)}后执行 · ${timing.reason || '队列限速'}`;
   }
 
   function readWorkerLock() {
@@ -466,10 +525,10 @@
       if (!heartbeatWorkerLock()) return false;
       const queue = readQueue();
       if (!queue.items.some(item => item.status === 'queued')) return false;
-      const remaining = Number(readTiming().nextRunAt || 0) - Date.now();
+      const remaining = Number(refreshRateLimitTiming().nextRunAt || 0) - Date.now();
       if (remaining <= 0) return true;
       renderPanel(queue);
-      await sleep(Math.min(1000, remaining));
+      await sleep(Math.min(5000, remaining));
     }
   }
 
@@ -499,10 +558,7 @@
             setButtonsForHandle(next.handle, 'idle');
             continue;
           }
-          const timing = readTiming();
-          const count = timing.count + 1;
-          const delay = nextDelayForCompletedCount(count);
-          writeTiming({ count, nextRunAt: Date.now() + delay.ms, reason: delay.reason });
+          recordSuccessfulBlock();
           upsertQueueItem(next.handle, { displayName: next.displayName, avatarUrl: next.avatarUrl, comment: next.comment, status: 'blocked', error: '' });
           markArticlesBlocked(next.handle);
           toast(`已屏蔽 @${next.handle}`);
@@ -513,7 +569,7 @@
             setButtonsForHandle(next.handle, 'idle');
             continue;
           }
-          writeTiming({ ...readTiming(), nextRunAt: Date.now() + BLOCK_GAP_MS, reason: '失败后暂停 15 秒' });
+          refreshRateLimitTiming({ nextRunAt: Date.now() + FAILURE_COOLDOWN_MS, reason: '失败后暂停 15 秒' });
           upsertQueueItem(next.handle, { displayName: next.displayName, avatarUrl: next.avatarUrl, comment: next.comment, status: 'failed', error: err?.message || String(err) });
           clearQueuedHiddenArticles(next.handle);
           setButtonsForHandle(next.handle, 'idle');
@@ -1452,8 +1508,7 @@
       return;
     }
 
-    const queue = readQueue();
-    ensureInitialQueueDelay(!hasActiveQueue(queue));
+    refreshRateLimitTiming();
     const meta = sourceArticle ? queuePatchFromArticle(sourceArticle, handle, displayName) : { displayName };
     upsertQueueItem(handle, { ...meta, status: 'queued', error: '' });
     setButtonsForHandle(handle, 'queued');
