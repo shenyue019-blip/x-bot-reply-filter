@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X 快捷屏蔽按钮
 // @namespace    https://github.com/shenyue019-blip/x-bot-reply-filter
-// @version      1.3.4
+// @version      1.3.5
 // @description  在 X/Twitter 评论区给每条回复加一个快捷屏蔽按钮，先入队再按节奏屏蔽，并在页面边缘保留可撤销队列
 // @author       summeriscoming
 // @license      MIT
@@ -25,7 +25,7 @@
   'use strict';
 
   const SCRIPT_ID = 'xqb';
-  const SCRIPT_VERSION = '1.3.4';
+  const SCRIPT_VERSION = '1.3.5';
   const QUEUE_KEY = 'xqb_block_queue_v1';
   const TIMING_KEY = 'xqb_queue_timing_v1';
   const WORKER_LOCK_KEY = 'xqb_queue_worker_lock_v1';
@@ -410,7 +410,7 @@
     };
   }
 
-  function refreshRateLimitTiming(extra = {}) {
+  function computeRateLimitTiming(extra = {}) {
     const now = Date.now();
     const timing = readTiming();
     const state = rateLimitState(now, timing);
@@ -431,6 +431,11 @@
       nextRunAt,
       reason: nextRunAt > now ? reason : '可立即执行',
     };
+    return next;
+  }
+
+  function refreshRateLimitTiming(extra = {}) {
+    const next = computeRateLimitTiming(extra);
     writeTiming(next);
     return next;
   }
@@ -465,7 +470,7 @@
   }
 
   function queueDelayText() {
-    const timing = refreshRateLimitTiming();
+    const timing = computeRateLimitTiming();
     const remaining = Number(timing.nextRunAt || 0) - Date.now();
     if (remaining <= 0) return '';
     return `${formatDuration(remaining)}后执行 · ${timing.reason || '队列限速'}`;
@@ -535,7 +540,7 @@
       if (!heartbeatWorkerLock()) return false;
       const queue = readQueue();
       if (!queue.items.some(item => item.status === 'queued')) return false;
-      const remaining = Number(refreshRateLimitTiming().nextRunAt || 0) - Date.now();
+      const remaining = Number(computeRateLimitTiming().nextRunAt || 0) - Date.now();
       if (remaining <= 0) return true;
       renderPanel(queue);
       await sleep(Math.min(5000, remaining));
@@ -1061,19 +1066,71 @@
     items.forEach(item => renderQueueItem(body, item));
   }
 
+  function queueItemSignature(item) {
+    return [
+      item.key,
+      item.handle,
+      item.displayName,
+      item.avatarUrl,
+      item.comment,
+      item.status,
+      item.updatedAt,
+      item.error,
+    ].map(value => String(value ?? '').replace(/[\u001e\u001f]/g, ' ')).join('\u001f');
+  }
+
+  function queueListSignature(queue) {
+    const pendingItems = queueSectionItems(queue, 'pending');
+    const blockedItems = queueSectionItems(queue, 'blocked');
+    return [
+      'pending',
+      pendingItems.map(queueItemSignature).join('\u001e'),
+      'blocked',
+      blockedItems.map(queueItemSignature).join('\u001e'),
+    ].join('\u001e');
+  }
+
+  function setPanelStatusLine(body, activeCount) {
+    const text = activeCount ? queueDelayText() : '';
+    let status = Array.from(body.children).find(child => child.classList?.contains('xqb-status-line'));
+    if (!text) {
+      if (status) status.remove();
+      return;
+    }
+    if (!status) {
+      status = document.createElement('div');
+      status.className = 'xqb-status-line';
+      body.insertBefore(status, body.firstChild);
+    }
+    status.textContent = text;
+  }
+
   function renderPanel(queue = readQueue()) {
     if (!document.documentElement) return;
     const panel = ensurePanel();
     const collapsed = !!GM_getValue(PANEL_COLLAPSED_KEY, false);
     const counts = queueCounts(queue);
     const activeCount = counts.queued + counts.blocking;
+    const wasCollapsed = panel.dataset.collapsed === '1';
+    const previousBody = panel.querySelector('.xqb-body');
+    const previousScrollTop = previousBody?.scrollTop || 0;
+    const signature = queueListSignature(queue);
     panel.dataset.collapsed = collapsed ? '1' : '0';
     applyPanelGeometry(panel);
     if (collapsed) {
       panel.style.width = '38px';
       panel.style.height = '38px';
     }
+
+    if (!collapsed && !wasCollapsed && previousBody && panel.dataset.queueSignature === signature) {
+      const title = document.getElementById(`${SCRIPT_ID}-panel-title`);
+      if (title) title.textContent = panelTitleText(counts);
+      setPanelStatusLine(previousBody, activeCount);
+      return;
+    }
+
     panel.replaceChildren();
+    panel.dataset.queueSignature = signature;
 
     const head = document.createElement('div');
     head.className = 'xqb-head';
@@ -1102,13 +1159,8 @@
 
     const body = document.createElement('div');
     body.className = 'xqb-body';
-    const delay = queueDelayText();
-    if (activeCount && delay) {
-      const status = document.createElement('div');
-      status.className = 'xqb-status-line';
-      status.textContent = delay;
-      body.appendChild(status);
-    }
+    body.dataset.queueSignature = signature;
+    setPanelStatusLine(body, activeCount);
 
     const pendingItems = queueSectionItems(queue, 'pending');
     const blockedItems = queueSectionItems(queue, 'blocked');
@@ -1116,6 +1168,10 @@
     renderQueueSection(body, '已屏蔽', blockedItems);
 
     panel.appendChild(body);
+    body.scrollTop = Math.min(previousScrollTop, Math.max(0, body.scrollHeight - body.clientHeight));
+    requestAnimationFrame(() => {
+      body.scrollTop = Math.min(previousScrollTop, Math.max(0, body.scrollHeight - body.clientHeight));
+    });
     const resizer = document.createElement('div');
     resizer.className = 'xqb-resizer';
     resizer.title = '拖动调整大小';
