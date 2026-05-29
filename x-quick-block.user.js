@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X 快捷屏蔽按钮
 // @namespace    https://github.com/shenyue019-blip/x-bot-reply-filter
-// @version      1.3.6
+// @version      1.3.7
 // @description  在 X/Twitter 评论区给每条回复加一个快捷屏蔽按钮，先入队再按节奏屏蔽，并在页面边缘保留可撤销队列
 // @author       summeriscoming
 // @license      MIT
@@ -25,7 +25,7 @@
   'use strict';
 
   const SCRIPT_ID = 'xqb';
-  const SCRIPT_VERSION = '1.3.6';
+  const SCRIPT_VERSION = '1.3.7';
   const QUEUE_KEY = 'xqb_block_queue_v1';
   const TIMING_KEY = 'xqb_queue_timing_v1';
   const WORKER_LOCK_KEY = 'xqb_queue_worker_lock_v1';
@@ -292,6 +292,10 @@
 
   function isAuthError(error) {
     return /ct0|HTTP 401|HTTP 403|HTTP 419|登录|auth/i.test(String(error?.message || error || ''));
+  }
+
+  function isUserNotFoundError(error) {
+    return /not\s*found|notfound|does not exist|HTTP 404|错误码 50|用户不存在|不存在|找不到/i.test(String(error?.message || error || ''));
   }
 
   function autoRetryDelayMs(retryCount) {
@@ -667,8 +671,16 @@
             setButtonsForHandle(next.handle, 'idle');
             continue;
           }
-          refreshRateLimitTiming({ nextRunAt: Date.now() + FAILURE_COOLDOWN_MS, reason: '失败后暂停 15 秒' });
           const reason = cleanErrorText(err?.message || err || '未知错误');
+          if (isUserNotFoundError(reason)) {
+            removeQueueItem(next.key);
+            clearQueuedHiddenArticles(next.handle);
+            clearArticlesBlocked(next.handle);
+            setButtonsForHandle(next.handle, 'idle');
+            toast(`@${next.handle} 不存在，已从队列删除`);
+            continue;
+          }
+          refreshRateLimitTiming({ nextRunAt: Date.now() + FAILURE_COOLDOWN_MS, reason: '失败后暂停 15 秒' });
           const retryCount = Number(next.retryCount || 0) + 1;
           const canAutoRetry = !isAuthError(reason) && retryCount <= AUTO_RETRY_MAX;
           const nextRetryAt = canAutoRetry ? Date.now() + autoRetryDelayMs(retryCount) : 0;
