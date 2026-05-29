@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X 快捷屏蔽按钮
 // @namespace    https://github.com/shenyue019-blip/x-bot-reply-filter
-// @version      1.3.5
+// @version      1.3.6
 // @description  在 X/Twitter 评论区给每条回复加一个快捷屏蔽按钮，先入队再按节奏屏蔽，并在页面边缘保留可撤销队列
 // @author       summeriscoming
 // @license      MIT
@@ -25,7 +25,7 @@
   'use strict';
 
   const SCRIPT_ID = 'xqb';
-  const SCRIPT_VERSION = '1.3.5';
+  const SCRIPT_VERSION = '1.3.6';
   const QUEUE_KEY = 'xqb_block_queue_v1';
   const TIMING_KEY = 'xqb_queue_timing_v1';
   const WORKER_LOCK_KEY = 'xqb_queue_worker_lock_v1';
@@ -39,6 +39,8 @@
   const HOUR_WINDOW_MS = 60 * 60 * 1000;
   const DAY_WINDOW_MS = 24 * 60 * 60 * 1000;
   const MIN_BLOCK_GAP_MS = HALF_HOUR_WINDOW_MS / 10;
+  const AUTO_RETRY_MAX = 3;
+  const AUTO_RETRY_DELAYS_MS = [MIN_BLOCK_GAP_MS, 10 * 60 * 1000, 30 * 60 * 1000];
   const RATE_LIMIT_HISTORY_MAX = 120;
   const RATE_LIMITS = [
     { label: '30 分钟窗口', limit: 10, windowMs: HALF_HOUR_WINDOW_MS },
@@ -232,7 +234,7 @@
           if (resp.status >= 200 && resp.status < 300) {
             resolve(resp.responseText || '');
           } else {
-            reject(new Error(`HTTP ${resp.status}`));
+            reject(new Error(apiErrorMessage(resp)));
           }
         },
         onerror() { reject(new Error('网络请求失败')); },
@@ -262,6 +264,41 @@
     return new Promise(resolve => window.setTimeout(resolve, Math.max(0, Number(ms) || 0)));
   }
 
+  function cleanErrorText(value, max = 260) {
+    return String(value || '')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, max);
+  }
+
+  function apiErrorMessage(resp) {
+    const status = Number(resp?.status || 0) || 0;
+    const statusText = cleanErrorText(resp?.statusText || '', 60);
+    const prefix = statusText ? `HTTP ${status} ${statusText}` : `HTTP ${status}`;
+    const raw = String(resp?.responseText || '').trim();
+    if (!raw) return prefix;
+
+    try {
+      const json = JSON.parse(raw);
+      const error = Array.isArray(json?.errors) ? json.errors[0] : null;
+      const message = cleanErrorText(error?.message || json?.error || json?.message || raw);
+      const code = error?.code ? `错误码 ${error.code}` : '';
+      return [prefix, code, message].filter(Boolean).join('：');
+    } catch (_) {
+      return `${prefix}：${cleanErrorText(raw)}`;
+    }
+  }
+
+  function isAuthError(error) {
+    return /ct0|HTTP 401|HTTP 403|HTTP 419|登录|auth/i.test(String(error?.message || error || ''));
+  }
+
+  function autoRetryDelayMs(retryCount) {
+    const index = Math.max(0, Math.min(AUTO_RETRY_DELAYS_MS.length - 1, Number(retryCount || 1) - 1));
+    return AUTO_RETRY_DELAYS_MS[index];
+  }
+
   function emptyQueue() {
     return { version: 1, updatedAt: Date.now(), items: [] };
   }
@@ -283,7 +320,9 @@
         status: ['queued', 'blocking', 'blocked', 'failed', 'unblocking', 'unblocked'].includes(rawItem.status) ? rawItem.status : 'queued',
         addedAt: Number(rawItem.addedAt || rawItem.blockedAt || Date.now()) || Date.now(),
         updatedAt: Number(rawItem.updatedAt || Date.now()) || Date.now(),
-        error: String(rawItem.error || '').slice(0, 160),
+        error: cleanErrorText(rawItem.error || ''),
+        retryCount: Math.max(0, Number(rawItem.retryCount || 0) || 0),
+        nextRetryAt: Math.max(0, Number(rawItem.nextRetryAt || 0) || 0),
       });
       if (items.length >= MAX_QUEUE_ITEMS) break;
     }
@@ -320,8 +359,12 @@
       status: patch.status || existing?.status || 'blocked',
       addedAt: existing?.addedAt || now,
       updatedAt: now,
-      error: String(patch.error ?? '').slice(0, 160),
+      error: cleanErrorText(patch.error ?? ''),
+      retryCount: Math.max(0, Number(patch.retryCount ?? existing?.retryCount ?? 0) || 0),
+      nextRetryAt: Math.max(0, Number(patch.nextRetryAt ?? existing?.nextRetryAt ?? 0) || 0),
     };
+    if (next.status !== 'failed') next.nextRetryAt = 0;
+    if (['blocked', 'unblocked'].includes(next.status)) next.retryCount = 0;
     queue.items = [next, ...queue.items.filter(item => item.key !== key)].slice(0, MAX_QUEUE_ITEMS);
     writeQueue(queue);
     return next;
@@ -516,6 +559,39 @@
     return changed ? queue : readQueue();
   }
 
+  function promoteDueFailedRetries(queue = readQueue()) {
+    const now = Date.now();
+    let changed = false;
+    queue.items = queue.items.map(item => {
+      if (item.status !== 'failed') return item;
+      if (!item.nextRetryAt || item.nextRetryAt > now || item.retryCount > AUTO_RETRY_MAX) return item;
+      changed = true;
+      return {
+        ...item,
+        status: 'queued',
+        error: '',
+        nextRetryAt: 0,
+        updatedAt: now,
+      };
+    });
+    if (changed) writeQueue(queue);
+    return changed ? queue : readQueue();
+  }
+
+  function nextAutoRetryDelay(queue = readQueue()) {
+    const now = Date.now();
+    const nextRetryAt = queue.items
+      .filter(item => item.status === 'failed' && item.nextRetryAt > now && item.retryCount <= AUTO_RETRY_MAX)
+      .map(item => Number(item.nextRetryAt) || 0)
+      .filter(Boolean)
+      .sort((a, b) => a - b)[0];
+    return nextRetryAt ? Math.max(0, nextRetryAt - now) : null;
+  }
+
+  function hasQueuedOrFutureRetry(queue = readQueue()) {
+    return queue.items.some(item => item.status === 'queued') || nextAutoRetryDelay(queue) !== null;
+  }
+
   function scheduleQueueWorker(delay = 0) {
     if (workerWakeTimer) window.clearTimeout(workerWakeTimer);
     workerWakeTimer = window.setTimeout(() => {
@@ -526,8 +602,15 @@
 
   function maybeStartQueueWorker() {
     if (workerActive) return;
-    const queue = recoverStaleRunningItems();
-    if (!queue.items.some(item => item.status === 'queued')) return;
+    const queue = promoteDueFailedRetries(recoverStaleRunningItems());
+    if (!queue.items.some(item => item.status === 'queued')) {
+      const retryDelay = nextAutoRetryDelay(queue);
+      if (retryDelay !== null) {
+        renderPanel(queue);
+        scheduleQueueWorker(Math.min(retryDelay, 60 * 1000));
+      }
+      return;
+    }
     if (!acquireWorkerLock()) {
       scheduleQueueWorker(2000);
       return;
@@ -585,11 +668,23 @@
             continue;
           }
           refreshRateLimitTiming({ nextRunAt: Date.now() + FAILURE_COOLDOWN_MS, reason: '失败后暂停 15 秒' });
-          upsertQueueItem(next.handle, { displayName: next.displayName, avatarUrl: next.avatarUrl, comment: next.comment, status: 'failed', error: err?.message || String(err) });
+          const reason = cleanErrorText(err?.message || err || '未知错误');
+          const retryCount = Number(next.retryCount || 0) + 1;
+          const canAutoRetry = !isAuthError(reason) && retryCount <= AUTO_RETRY_MAX;
+          const nextRetryAt = canAutoRetry ? Date.now() + autoRetryDelayMs(retryCount) : 0;
+          upsertQueueItem(next.handle, {
+            displayName: next.displayName,
+            avatarUrl: next.avatarUrl,
+            comment: next.comment,
+            status: 'failed',
+            error: reason,
+            retryCount,
+            nextRetryAt,
+          });
           clearQueuedHiddenArticles(next.handle);
           setButtonsForHandle(next.handle, 'idle');
-          toast(`屏蔽 @${next.handle} 失败：${err?.message || err}`, true);
-          if (/ct0|HTTP 401|HTTP 403|HTTP 419|登录|auth/i.test(String(err?.message || err))) break;
+          toast(`屏蔽 @${next.handle} 失败：${reason}`, true);
+          if (isAuthError(reason)) break;
         } finally {
           busyHandles.delete(next.key);
         }
@@ -600,7 +695,7 @@
       const queue = readQueue();
       renderPanel(queue);
       setTimeout(() => {
-        if (readQueue().items.some(item => item.status === 'queued')) maybeStartQueueWorker();
+        if (hasQueuedOrFutureRetry(readQueue())) maybeStartQueueWorker();
       }, 1200);
     }
   }
@@ -767,6 +862,10 @@
         justify-content: center;
         text-align: center;
       }
+      .xqb-icon-btn:disabled {
+        opacity: .42;
+        cursor: default;
+      }
       .xqb-body {
         flex: 1;
         min-height: 0;
@@ -855,6 +954,17 @@
         overflow: hidden;
         word-break: break-word;
       }
+      .xqb-error {
+        margin-top: 4px;
+        color: #f4212e;
+        font-size: 11px;
+        line-height: 1.32;
+        display: -webkit-box;
+        -webkit-line-clamp: 2;
+        -webkit-box-orient: vertical;
+        overflow: hidden;
+        word-break: break-word;
+      }
       .xqb-meta {
         margin-top: 2px;
         color: #536471;
@@ -885,6 +995,7 @@
       #xqb-panel[data-collapsed="1"] .xqb-title,
       #xqb-panel[data-collapsed="1"] .xqb-body,
       #xqb-panel[data-collapsed="1"] .xqb-clear,
+      #xqb-panel[data-collapsed="1"] .xqb-retry-all,
       #xqb-panel[data-collapsed="1"] .xqb-resizer { display: none !important; }
       #xqb-panel[data-collapsed="1"] .xqb-head {
         width: 38px;
@@ -1025,13 +1136,28 @@
     const meta = document.createElement('div');
     meta.className = 'xqb-meta';
     const bits = [statusText(item.status), shortTime(item.updatedAt)];
-    if (item.error) bits.push(item.error);
+    if (item.status === 'failed' && item.nextRetryAt && item.retryCount <= AUTO_RETRY_MAX) {
+      const remaining = Number(item.nextRetryAt || 0) - Date.now();
+      bits.push(remaining > 0 ? `自动重试 ${item.retryCount}/${AUTO_RETRY_MAX} · ${formatDuration(remaining)}后` : `自动重试 ${item.retryCount}/${AUTO_RETRY_MAX} · 即将执行`);
+    } else if (item.status === 'failed' && item.retryCount > AUTO_RETRY_MAX) {
+      bits.push('自动重试已停止');
+    } else if (item.status === 'failed' && item.retryCount > 0) {
+      bits.push('需手动重试');
+    }
     meta.textContent = bits.filter(Boolean).join(' · ');
+    meta.title = meta.textContent;
     const comment = document.createElement('div');
     comment.className = 'xqb-comment';
     comment.textContent = item.comment || '未抓取到评论文本';
     comment.title = item.comment || '';
     person.append(name, meta, comment);
+    if (item.status === 'failed' && item.error) {
+      const error = document.createElement('div');
+      error.className = 'xqb-error';
+      error.textContent = `失败原因：${item.error}`;
+      error.title = item.error;
+      person.appendChild(error);
+    }
 
     const actions = document.createElement('div');
     actions.className = 'xqb-actions';
@@ -1076,6 +1202,8 @@
       item.status,
       item.updatedAt,
       item.error,
+      item.retryCount,
+      item.nextRetryAt,
     ].map(value => String(value ?? '').replace(/[\u001e\u001f]/g, ' ')).join('\u001f');
   }
 
@@ -1144,6 +1272,13 @@
     clear.dataset.action = 'clear';
     clear.title = '清理已撤销和失败记录';
     clear.textContent = '清';
+    const retryAll = document.createElement('button');
+    retryAll.type = 'button';
+    retryAll.className = 'xqb-icon-btn xqb-retry-all';
+    retryAll.dataset.action = 'retry-all';
+    retryAll.title = counts.failed ? `一键重试 ${counts.failed} 个失败项` : '暂无失败项可重试';
+    retryAll.textContent = '重';
+    retryAll.disabled = !counts.failed;
     const collapse = document.createElement('button');
     collapse.type = 'button';
     collapse.className = 'xqb-icon-btn';
@@ -1151,7 +1286,7 @@
     collapse.title = collapsed ? '展开快捷屏蔽队列' : '收起快捷屏蔽队列';
     collapse.textContent = collapsed ? '禁' : '-';
     if (collapsed) head.appendChild(collapse);
-    else head.append(title, clear, collapse);
+    else head.append(title, retryAll, clear, collapse);
     panel.appendChild(head);
     makePanelDraggable(panel, head);
 
@@ -1201,6 +1336,55 @@
     return btn;
   }
 
+  function syncRetriedHandle(handle) {
+    setButtonsForHandle(handle, 'queued');
+    tweetArticles().forEach(article => {
+      if (articleHasHandle(article, handle)) syncArticleQueueState(article, handle);
+    });
+  }
+
+  function retryFailedItem(item, resetRetry = true) {
+    if (!item || item.status !== 'failed') return false;
+    upsertQueueItem(item.handle, {
+      displayName: item.displayName,
+      avatarUrl: item.avatarUrl,
+      comment: item.comment,
+      status: 'queued',
+      error: '',
+      retryCount: resetRetry ? 0 : item.retryCount,
+      nextRetryAt: 0,
+    });
+    syncRetriedHandle(item.handle);
+    maybeStartQueueWorker();
+    return true;
+  }
+
+  function retryAllFailedItems() {
+    const queue = readQueue();
+    const now = Date.now();
+    const handles = [];
+    queue.items = queue.items.map(item => {
+      if (item.status !== 'failed') return item;
+      handles.push(item.handle);
+      return {
+        ...item,
+        status: 'queued',
+        error: '',
+        retryCount: 0,
+        nextRetryAt: 0,
+        updatedAt: now,
+      };
+    });
+    if (!handles.length) {
+      toast('暂无失败项可重试');
+      return;
+    }
+    writeQueue(queue);
+    handles.forEach(syncRetriedHandle);
+    maybeStartQueueWorker();
+    toast(`已重新加入 ${handles.length} 个失败项`);
+  }
+
   async function onPanelClick(event) {
     const panel = event.target.closest(`#${SCRIPT_ID}-panel`);
     if (panel?.dataset.collapsed === '1') {
@@ -1229,6 +1413,10 @@
       maybeStartQueueWorker();
       return;
     }
+    if (action === 'retry-all') {
+      retryAllFailedItems();
+      return;
+    }
 
     const key = btn.dataset.key;
     const item = getQueueItem(key);
@@ -1242,7 +1430,7 @@
       return;
     }
     if (action === 'retry') {
-      enqueueBlock(item.handle, item.displayName);
+      retryFailedItem(item, true);
       return;
     }
     if (action === 'undo') {
