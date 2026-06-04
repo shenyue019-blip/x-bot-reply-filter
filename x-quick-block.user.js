@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X 快捷屏蔽按钮
 // @namespace    https://github.com/shenyue019-blip/x-bot-reply-filter
-// @version      1.3.7
+// @version      1.3.8
 // @description  在 X/Twitter 评论区给每条回复加一个快捷屏蔽按钮，先入队再按节奏屏蔽，并在页面边缘保留可撤销队列
 // @author       summeriscoming
 // @license      MIT
@@ -25,7 +25,7 @@
   'use strict';
 
   const SCRIPT_ID = 'xqb';
-  const SCRIPT_VERSION = '1.3.7';
+  const SCRIPT_VERSION = '1.3.8';
   const QUEUE_KEY = 'xqb_block_queue_v1';
   const TIMING_KEY = 'xqb_queue_timing_v1';
   const WORKER_LOCK_KEY = 'xqb_queue_worker_lock_v1';
@@ -320,6 +320,7 @@
         handle: displayHandle(rawItem.handle || key) || key,
         displayName: String(rawItem.displayName || '').slice(0, 80),
         avatarUrl: String(rawItem.avatarUrl || '').slice(0, 500),
+        blueVerified: !!rawItem.blueVerified,
         comment: String(rawItem.comment || rawItem.tweetText || '').replace(/\s+/g, ' ').trim().slice(0, 280),
         status: ['queued', 'blocking', 'blocked', 'failed', 'unblocking', 'unblocked'].includes(rawItem.status) ? rawItem.status : 'queued',
         addedAt: Number(rawItem.addedAt || rawItem.blockedAt || Date.now()) || Date.now(),
@@ -359,6 +360,7 @@
       handle: displayHandle(handle) || existing?.handle || key,
       displayName: String(patch.displayName ?? existing?.displayName ?? '').slice(0, 80),
       avatarUrl: String(patch.avatarUrl ?? existing?.avatarUrl ?? '').slice(0, 500),
+      blueVerified: !!(patch.blueVerified ?? existing?.blueVerified ?? false),
       comment: String(patch.comment ?? existing?.comment ?? '').replace(/\s+/g, ' ').trim().slice(0, 280),
       status: patch.status || existing?.status || 'blocked',
       addedAt: existing?.addedAt || now,
@@ -939,7 +941,9 @@
         justify-content: center;
         font-size: 13px;
         font-weight: 900;
+        text-decoration: none;
       }
+      .xqb-avatar:hover { outline: 2px solid rgba(29,155,240,.3); }
       .xqb-avatar img {
         width: 100%;
         height: 100%;
@@ -948,12 +952,21 @@
       }
       .xqb-person { min-width: 0; }
       .xqb-name {
+        display: block;
+        color: #0f1419;
         font-size: 12px;
         line-height: 1.25;
         font-weight: 800;
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
+        text-decoration: none;
+      }
+      .xqb-name:hover { text-decoration: underline; }
+      .xqb-blue-v {
+        color: #1d9bf0;
+        font-size: 12px;
+        font-weight: 900;
       }
       .xqb-comment {
         margin-top: 3px;
@@ -1109,8 +1122,12 @@
   }
 
   function makeAvatarNode(item) {
-    const avatar = document.createElement('div');
+    const avatar = document.createElement('a');
     avatar.className = 'xqb-avatar';
+    avatar.href = `https://x.com/${encodeURIComponent(item.handle || item.key)}`;
+    avatar.target = '_blank';
+    avatar.rel = 'noopener noreferrer';
+    avatar.title = `打开 @${item.handle || item.key} 的主页`;
     const src = String(item.avatarUrl || '').trim();
     if (src) {
       const img = document.createElement('img');
@@ -1142,9 +1159,20 @@
 
     const person = document.createElement('div');
     person.className = 'xqb-person';
-    const name = document.createElement('div');
+    const name = document.createElement('a');
     name.className = 'xqb-name';
-    name.textContent = `${item.displayName || item.handle || item.key} · @${item.handle}`;
+    name.href = `https://x.com/${encodeURIComponent(item.handle || item.key)}`;
+    name.target = '_blank';
+    name.rel = 'noopener noreferrer';
+    name.title = `打开 @${item.handle || item.key} 的主页`;
+    name.append(document.createTextNode(`${item.displayName || item.handle || item.key} · @${item.handle}`));
+    if (item.blueVerified) {
+      const verified = document.createElement('span');
+      verified.className = 'xqb-blue-v';
+      verified.textContent = ' 蓝V';
+      verified.title = '蓝 V 认证';
+      name.appendChild(verified);
+    }
     const meta = document.createElement('div');
     meta.className = 'xqb-meta';
     const bits = [statusText(item.status), shortTime(item.updatedAt)];
@@ -1210,6 +1238,7 @@
       item.handle,
       item.displayName,
       item.avatarUrl,
+      item.blueVerified,
       item.comment,
       item.status,
       item.updatedAt,
@@ -1548,6 +1577,39 @@
     return String(img?.src || '').slice(0, 500);
   }
 
+  function extractBlueVerifiedFromArticle(article) {
+    const nameEl = article.querySelector('[data-testid="User-Name"]');
+    if (!nameEl) return false;
+    const candidates = nameEl.querySelectorAll(
+      'svg[data-testid="icon-verified"], [aria-label*="Verified"], [aria-label*="verified"], [aria-label*="认证"]'
+    );
+    for (const candidate of candidates) {
+      let node = candidate;
+      for (let depth = 0; node && depth < 4; depth += 1, node = node.parentElement) {
+        const style = getComputedStyle(node);
+        const colors = [
+          style.color,
+          style.fill,
+          node.getAttribute?.('color'),
+          node.getAttribute?.('fill'),
+          node.getAttribute?.('style'),
+        ].join(' ').toLowerCase();
+        if (/#1d9bf0|rgb\s*\(\s*29\s*,\s*155\s*,\s*240\s*\)/i.test(colors)) return true;
+      }
+    }
+    return false;
+  }
+
+  function enrichQueuedVerification(handle, blueVerified) {
+    if (!blueVerified) return;
+    const key = normalizeHandle(handle);
+    const queue = readQueue();
+    const item = getQueueItem(key, queue);
+    if (!item || item.blueVerified) return;
+    queue.items = queue.items.map(entry => entry.key === key ? { ...entry, blueVerified: true } : entry);
+    writeQueue(queue);
+  }
+
   function cleanCommentText(value) {
     return String(value || '').replace(/\s+/g, ' ').trim();
   }
@@ -1608,6 +1670,7 @@
     return {
       displayName: name,
       avatarUrl: extractAvatarFromArticle(article),
+      blueVerified: extractBlueVerifiedFromArticle(article),
       comment: extractCommentFromArticle(article, handle, name),
     };
   }
@@ -1658,6 +1721,7 @@
       btn.setAttribute('aria-label', `快捷屏蔽 @${handle}`);
 
       const item = getQueueItem(key);
+      if (item) enrichQueuedVerification(handle, extractBlueVerifiedFromArticle(article));
       setButtonState(btn, isHiddenQueueStatus(item?.status) ? item.status : 'idle');
 
       btn.addEventListener('click', event => {
