@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X 快捷屏蔽按钮
 // @namespace    https://github.com/shenyue019-blip/x-bot-reply-filter
-// @version      1.3.8
+// @version      1.3.9
 // @description  在 X/Twitter 评论区给每条回复加一个快捷屏蔽按钮，先入队再按节奏屏蔽，并在页面边缘保留可撤销队列
 // @author       summeriscoming
 // @license      MIT
@@ -25,7 +25,7 @@
   'use strict';
 
   const SCRIPT_ID = 'xqb';
-  const SCRIPT_VERSION = '1.3.8';
+  const SCRIPT_VERSION = '1.3.9';
   const QUEUE_KEY = 'xqb_block_queue_v1';
   const TIMING_KEY = 'xqb_queue_timing_v1';
   const WORKER_LOCK_KEY = 'xqb_queue_worker_lock_v1';
@@ -786,15 +786,15 @@
         display: inline-flex !important;
         align-items: center !important;
         justify-content: center !important;
-        width: 18px !important;
-        height: 18px !important;
+        width: 24px !important;
+        height: 24px !important;
         margin: 0 !important;
         padding: 0 !important;
         border: 1.5px solid #f4212e !important;
         border-radius: 999px !important;
         background: rgba(244, 33, 46, .08) !important;
         color: #f4212e !important;
-        font: 800 10px/1 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif !important;
+        font: 800 13px/1 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif !important;
         cursor: pointer !important;
         box-sizing: border-box !important;
         flex: 0 0 auto !important;
@@ -1739,7 +1739,7 @@
       article.style.position = 'relative';
       Object.assign(btn.style, {
         position: 'absolute',
-        top: '12px',
+        top: '9px',
         right: '72px',
       });
       article.appendChild(btn);
